@@ -1,0 +1,27 @@
+# Decision settings. Every feeder writing the same store shares these; a
+# feeder can layer its own YAML or overrides on top via load_settings().
+# Which store, embedding model and judge to use are objects the caller
+# constructs (see topicsleuth.interfaces), not settings.
+
+# What the store follows, as a noun phrase the prompts are rendered with.
+domain: the field this store follows
+
+embedding:
+  dimensions: 1024          # what the store's vector index was built for
+
+candidates:
+  tag_overlap: true
+  # Tags excluded from overlap matching. List any tag every item carries
+  # (the tag a feeder selects items by, for instance); matching on such a
+  # tag turns the channel into "every topic that ever copied it".
+  ignored_tags: []
+  vector_limit: 30          # nearest topics per item
+  vector_num_candidates: 200  # approximate-search breadth, for stores that take it
+
+synthesize:
+  # Second independent pass before any propose_new is accepted. See
+  # SynthesizeConfig in settings.py.
+  confirm_proposals: true
+  confirm_candidates: 5
+  confirm_backend: judge       # judge | decision
+  confirm_link_threshold: 0.7  # decision backend: p(belongs) needed to demote a proposal to a link

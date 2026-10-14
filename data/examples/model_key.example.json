@@ -1,0 +1,17 @@
+{
+ "p001": {
+  "stratum": "C_model_link",
+  "run": "example",
+  "seed": 1,
+  "model_label": "same_question",
+  "model_decision": "link_existing",
+  "first_pass_strength": 0.95
+ },
+ "p002": {
+  "stratum": "E_model_adjacent_unchosen",
+  "run": "example",
+  "seed": 1,
+  "model_label": "adjacent_question",
+  "model_decision": "skip"
+ }
+}

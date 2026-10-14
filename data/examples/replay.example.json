@@ -1,0 +1,200 @@
+{
+ "run_at": "2026-01-01T00:00:00+00:00",
+ "stage": "synthesize",
+ "sample_size": 2,
+ "seed": 1,
+ "sample_query": null,
+ "replay_from": null,
+ "label": "example",
+ "leave_one_out": true,
+ "topic_universe": 12,
+ "config": {
+  "model": "example-judge",
+  "embedding_model": "example-embedder",
+  "candidates": {
+   "tag_overlap": true,
+   "ignored_tags": [],
+   "vector_limit": 30,
+   "vector_num_candidates": 200
+  },
+  "synthesize": {
+   "confirm_proposals": true,
+   "confirm_candidates": 5,
+   "confirm_backend": "judge",
+   "confirm_link_threshold": 0.7
+  }
+ },
+ "summary": {
+  "total": 2,
+  "decisions": {
+   "link_existing": 1,
+   "propose_new": 1,
+   "skip": 0
+  },
+  "decisions_pct": {
+   "link_existing": 50.0,
+   "propose_new": 50.0,
+   "skip": 0.0
+  },
+  "strength_buckets": {
+   "<0.3": 0,
+   "0.3-0.5": 0,
+   "0.5-0.7": 0,
+   "0.7-0.8": 0,
+   "0.8-0.9": 0,
+   "0.9+": 1
+  },
+  "connection_types": {
+   "supports": 1
+  },
+  "new_topics": [
+   {
+    "topic_id": "solar-panel-take-back-obligations",
+    "title": "Who bears the cost of collecting end-of-life solar panels?",
+    "summary": "Tracks take-back and collection obligations placed on installers, manufacturers and owners.",
+    "scope_test_question": "Who bears the cost of collecting end-of-life solar panels?",
+    "differentiation_from_closest": "solar-panel-recycling-recovery-yields tracks what recycling recovers, not who must collect"
+   }
+  ],
+  "link_targets": {
+   "solar-panel-recycling-recovery-yields": 1
+  },
+  "diagnostics": {
+   "mean_total_candidates": 5.0,
+   "mean_tag_only_candidates": 0.0,
+   "mean_input_tokens": 9950.0,
+   "mean_output_tokens": 1000.0,
+   "mean_classified_per_call": 1.0,
+   "chosen_channel": {
+    "vector": 1
+   },
+   "chosen_vector_rank": {
+    "1": 1
+   },
+   "gate_overrides": 0,
+   "confirmation": {
+    "confirmed_new": 1
+   },
+   "mean_confirm_input_tokens": 4100.0,
+   "by_decision": {
+    "link_existing": {
+     "n": 1,
+     "mean_vector_top1": 0.91,
+     "labels": {
+      "same_question": 1
+     }
+    },
+    "propose_new": {
+     "n": 1,
+     "mean_vector_top1": 0.79,
+     "labels": {
+      "adjacent_question": 1
+     }
+    }
+   }
+  }
+ },
+ "decisions": [
+  {
+   "item_url": "https://example.org/papers/solar-recycling-yield",
+   "item_title": "Benchmarking Recycling Yield for End-of-Life Solar Panels",
+   "item_source": "example-journal",
+   "decision": "link_existing",
+   "topic_id": "solar-panel-recycling-recovery-yields",
+   "connection_type": "supports",
+   "strength": 0.95,
+   "reasoning_trace": "Same question: the item reports the yields the topic tracks.",
+   "diagnostics": {
+    "confirmation": null,
+    "jev_scores": null,
+    "confirm_input_tokens": null,
+    "confirm_output_tokens": null,
+    "vector_candidates": 5,
+    "tag_candidates": 0,
+    "tag_only_candidates": 0,
+    "batch_candidates": 0,
+    "total_candidates": 5,
+    "vector_top1": 0.91,
+    "vector_top5": [
+     0.91,
+     0.84,
+     0.8,
+     0.77,
+     0.75
+    ],
+    "vector_min": 0.75,
+    "classified": [
+     {
+      "topic_id": "solar-panel-recycling-recovery-yields",
+      "label": "same_question",
+      "vector_rank": 1,
+      "vector_score": 0.91,
+      "from_batch": false
+     }
+    ],
+    "chosen_channel": "vector",
+    "chosen_vector_rank": 1,
+    "gate_override": false,
+    "input_tokens": 9800,
+    "output_tokens": 900
+   }
+  },
+  {
+   "item_url": "https://example.org/news/take-back-ordinance",
+   "item_title": "A Municipal Ordinance Requiring Panel Take-Back",
+   "item_source": "example-news",
+   "decision": "propose_new",
+   "topic_id": null,
+   "connection_type": null,
+   "strength": null,
+   "reasoning_trace": "No candidate tracks collection policy; the question is right-sized.",
+   "new_topic": {
+    "topic_id": "solar-panel-take-back-obligations",
+    "title": "Who bears the cost of collecting end-of-life solar panels?",
+    "summary": "Tracks take-back and collection obligations placed on installers, manufacturers and owners.",
+    "tags": [
+     "policy"
+    ],
+    "suggested_directions": [
+     "Compare installer-pays and manufacturer-pays regimes on collection rates"
+    ],
+    "scope_test_question": "Who bears the cost of collecting end-of-life solar panels?",
+    "differentiation_from_closest": "solar-panel-recycling-recovery-yields tracks what recycling recovers, not who must collect"
+   },
+   "diagnostics": {
+    "confirmation": "confirmed_new",
+    "jev_scores": null,
+    "confirm_input_tokens": 4100,
+    "confirm_output_tokens": 300,
+    "vector_candidates": 5,
+    "tag_candidates": 0,
+    "tag_only_candidates": 0,
+    "batch_candidates": 0,
+    "total_candidates": 5,
+    "vector_top1": 0.79,
+    "vector_top5": [
+     0.79,
+     0.74,
+     0.7,
+     0.66,
+     0.6
+    ],
+    "vector_min": 0.6,
+    "classified": [
+     {
+      "topic_id": "solar-panel-recycling-recovery-yields",
+      "label": "adjacent_question",
+      "vector_rank": 1,
+      "vector_score": 0.79,
+      "from_batch": false
+     }
+    ],
+    "chosen_channel": null,
+    "chosen_vector_rank": null,
+    "gate_override": false,
+    "input_tokens": 10100,
+    "output_tokens": 1100
+   }
+  }
+ ]
+}

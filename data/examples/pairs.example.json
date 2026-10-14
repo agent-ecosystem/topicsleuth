@@ -1,0 +1,50 @@
+{
+ "version": 1,
+ "labels": [
+  "same_question",
+  "subset_question",
+  "adjacent_question",
+  "surface_overlap"
+ ],
+ "pairs": [
+  {
+   "id": "p001",
+   "item": {
+    "title": "Benchmarking Recycling Yield for End-of-Life Solar Panels",
+    "url": "https://example.org/papers/solar-recycling-yield",
+    "summary": "Measures silicon and silver recovery rates across three recycling processes on 200 decommissioned panels.",
+    "excerpt": "We report recovery yields for silicon, silver and glass under thermal, mechanical and chemical delamination..."
+   },
+   "topic": {
+    "title": "What recovery yields do end-of-life solar panel recycling processes reach?",
+    "summary": "Tracks measured material recovery rates for decommissioned photovoltaic panels across recycling methods.",
+    "representative_observations": [
+     "Chemical delamination recovers 94% of silver from monocrystalline panels",
+     "A pilot line reports glass recovery at 98% purity"
+    ],
+    "evidence_count": 7
+   },
+   "label": "same_question",
+   "note": "The item measures exactly the yields the topic tracks."
+  },
+  {
+   "id": "p002",
+   "item": {
+    "title": "A Municipal Ordinance Requiring Panel Take-Back",
+    "url": "https://example.org/news/take-back-ordinance",
+    "summary": "A city council passes a rule requiring installers to accept returned panels.",
+    "excerpt": "The ordinance, effective next year, shifts collection costs to installers..."
+   },
+   "topic": {
+    "title": "What recovery yields do end-of-life solar panel recycling processes reach?",
+    "summary": "Tracks measured material recovery rates for decommissioned photovoltaic panels across recycling methods.",
+    "representative_observations": [
+     "Chemical delamination recovers 94% of silver from monocrystalline panels"
+    ],
+    "evidence_count": 7
+   },
+   "label": "adjacent_question",
+   "note": "Same field, different question: collection policy rather than recovery yield."
+  }
+ ]
+}

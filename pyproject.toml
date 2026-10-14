@@ -1,0 +1,61 @@
+[project]
+name = "topicsleuth"
+version = "0.1.0"
+description = "Topic detection and tracking over a stream of documents: link each item to a topic or open a new one, keep the evidence, and measure how topics move."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+authors = [{ name = "Dachary Carey", email = "dc@dacharycarey.com" }]
+keywords = [
+    "topic detection",
+    "topic tracking",
+    "topic detection and tracking",
+    "first-story detection",
+    "llm",
+    "vector search",
+    "mongodb",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Text Processing :: Indexing",
+]
+dependencies = [
+    "pyyaml",
+    "numpy",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+mongo = ["pymongo>=4.6"]
+voyage = ["voyageai"]
+anthropic = ["anthropic"]
+all = ["pymongo>=4.6", "voyageai", "anthropic"]
+test = ["pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://topicsleuth.dev"
+Repository = "https://github.com/agent-ecosystem/topicsleuth"
+Issues = "https://github.com/agent-ecosystem/topicsleuth/issues"
+
+[project.scripts]
+topicsleuth = "topicsleuth.cli:main"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["topicsleuth*"]
+
+[tool.setuptools.package-data]
+topicsleuth = ["config/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

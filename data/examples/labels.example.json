@@ -1,0 +1,15 @@
+{
+ "rater": "example-rater",
+ "note": "Shape of a rater file: one entry per pair id with a label and optional detail.",
+ "labels": {
+  "p001": {
+   "label": "same_question",
+   "confidence": 0.91
+  },
+  "p002": {
+   "label": "adjacent_question",
+   "confidence": 0.78
+  }
+ },
+ "errors": {}
+}
