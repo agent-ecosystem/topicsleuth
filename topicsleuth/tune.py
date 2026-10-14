@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import logging
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -42,6 +42,14 @@ def _eval_from_item(item: dict) -> _StoredEval | None:
     if not item.get("embedding"):
         return None
     return _StoredEval(url=item["url"], embedding=item["embedding"])
+
+
+def _library_version() -> str | None:
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        return version("topicsleuth")
+    except PackageNotFoundError:
+        return None
 
 
 def _replay_items(store: Store, prior_run: Path) -> list[dict]:
@@ -245,6 +253,7 @@ def replay_synthesis(
         print()
 
     decisions_dicts: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
     proposed_in_batch: list[dict] = []
 
     for i, item in enumerate(sample, 1):
@@ -262,6 +271,8 @@ def replay_synthesis(
             )
         except Exception as e:
             logger.exception("synthesize_item failed for %s", item.get("url"))
+            failures.append({"item_url": item.get("url"), "item_title": item.get("title", ""),
+                             "error": f"{type(e).__name__}: {e}"})
             if progress:
                 print(f"  [{i}/{len(sample)}] FAIL: {e}")
             continue
@@ -299,8 +310,12 @@ def replay_synthesis(
         "label": label,
         "topic_universe": len(store.list_topics(include_retired=False)),
         "config": {
+            "library_version": _library_version(),
             "model": getattr(judge, "model", None),
             "embedding_model": getattr(embedder, "model", None),
+            "decision_model": getattr(decision_model, "model", None) if decision_model else None,
+            "domain": settings.domain,
+            "rubric": asdict(settings.rubric),
             "candidates": {
                 "tag_overlap": settings.candidates.tag_overlap,
                 "ignored_tags": list(settings.candidates.ignored_tags),
@@ -316,6 +331,7 @@ def replay_synthesis(
         },
         "summary": summary,
         "decisions": decisions_dicts,
+        "failures": failures,
     }
 
     if output_path is None:

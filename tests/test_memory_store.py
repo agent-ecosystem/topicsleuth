@@ -67,13 +67,15 @@ def test_item_embeddings_and_delete_since():
     assert st.get_item_embeddings(["u1", "missing"]) == {"u1": [0.5, 0.5]}
     assert st.get_items(["u1"])[0]["url"] == "u1"
     then = datetime.now(timezone.utc) - timedelta(days=2)
-    st.create_observation({"topic_id": "a", "item_url": "u1", "date": then})
+    st.create_observation({"topic_id": "a", "item_url": "u1", "date": then, "recorded_at": then})
     st.create_observation({"topic_id": "a", "item_url": "u2"})
-    st.append_snapshot("a", {"date": then, "evidence_count": 1})
+    st.append_snapshot("a", {"date": then, "evidence_count": 1, "recorded_at": then})
     st.append_snapshot("a", {"date": datetime.now(timezone.utc), "evidence_count": 2})
     st.create_topic({"topic_id": "new"})
     result = st.delete_since(datetime.now(timezone.utc) - timedelta(days=1))
-    # every topic in _store() was founded just now, so all four go; the
-    # two-day-old observation and nothing else survives the sweep
-    assert result == {"observations_deleted": 1, "topics_deleted": 4, "snapshots_cleared": 0}
+    # every topic in _store() was recorded just now, so all but "a" go; "a"
+    # is kept because the two-day-old observation still sits on it, and
+    # its recent snapshot is cleared
+    assert result == {"observations_deleted": 1, "topics_deleted": 3, "topics_kept": 1, "snapshots_cleared": 1}
+    assert [s["evidence_count"] for s in st.get_topic("a")["snapshots"]] == [1]
     assert [o["item_url"] for o in st.list_observations()] == ["u1"]

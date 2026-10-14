@@ -21,6 +21,13 @@ logger = logging.getLogger(__name__)
 REASSIGN_BATCH_SIZE = 20
 
 
+class SplitPlanError(ValueError):
+    """The judge's plan cannot be executed as given: a sub-topic id that is
+    missing, duplicated or already taken, or an observation that is left
+    out, assigned twice, or assigned to a sub-topic that does not exist.
+    Nothing is written when this is raised."""
+
+
 def split_topic(
     topic_id: str,
     store: Store,
@@ -31,16 +38,26 @@ def split_topic(
 ) -> dict:
     """Split an oversized topic into more specific sub-topics.
 
-    Uses two LLM phases:
-    1. Propose sub-topics (single call)
-    2. Reassign observations in batches
+    Two judge phases: propose sub-topics (one call), then assign each
+    observation to one of them (in batches). The plan is validated in
+    full before anything is written (see ``validate_split_plan``), and a
+    dry run returns the plan with its problems instead of raising.
 
-    Returns a summary dict with sub_topics created and observations reassigned.
+    Execution moves the existing observations rather than replacing them:
+    each keeps its identity, date, tags and the rest of its metadata, gets
+    its new topic, the strength and connection type the judge assessed
+    against the narrower topic, and ``moved_from`` pointing at the parent.
+    The parent is retired with ``split_into``. Writes are per document, in
+    the order sub-topics, observations, parent; if one fails midway, the
+    parent is still live with whatever was not yet moved, the sub-topics
+    exist, and ``move-observation`` finishes the job by hand.
     """
     # 1. Fetch topic and observations
     topic = store.get_topic(topic_id)
     if not topic:
         raise ValueError(f"Topic not found: {topic_id}")
+    if topic.get("status") == "retired":
+        raise ValueError(f"Topic is retired: {topic_id}")
 
     observations = store.get_observations_for_topic(topic_id)
     if not observations:
@@ -52,23 +69,20 @@ def split_topic(
 
     # 2. Phase 1: Propose sub-topics
     sub_topics = _propose_sub_topics(topic, observations, judge, settings)
+    for st in sub_topics:
+        st["topic_id"] = _sanitize_topic_id(str(st.get("topic_id") or ""))
     logger.info("Proposed %d sub-topics", len(sub_topics))
     for st in sub_topics:
-        logger.info("  - %s: %s", st["topic_id"], st["title"])
+        logger.info("  - %s: %s", st["topic_id"], st.get("title"))
 
-    # 3. Phase 2: Reassign observations in batches
+    # 3. Phase 2: Assign observations in batches
     reassignments = _reassign_observations(topic, observations, sub_topics, judge, settings)
+    for r in reassignments:
+        if isinstance(r, dict):
+            r["new_topic_id"] = _sanitize_topic_id(str(r.get("new_topic_id") or ""))
 
-    # Validate all observations are reassigned
-    obs_urls = {obs["item_url"] for obs in observations}
-    reassigned_urls = {r["item_url"] for r in reassignments}
-    missing = obs_urls - reassigned_urls
-    if missing:
-        logger.warning(
-            "%d observations not reassigned, will be dropped: %s",
-            len(missing),
-            missing,
-        )
+    # 4. Validate the whole plan before writing anything
+    problems = validate_split_plan(topic_id, observations, sub_topics, reassignments, store)
 
     if dry_run:
         return {
@@ -76,90 +90,128 @@ def split_topic(
             "observation_count": len(observations),
             "sub_topics": sub_topics,
             "reassignments": reassignments,
-            "missing_reassignments": list(missing),
+            "problems": problems,
         }
+    if problems:
+        raise SplitPlanError("; ".join(problems))
 
     now = datetime.now(timezone.utc)
 
-    # 4. Create sub-topics with embeddings
+    # 5. Create sub-topics with embeddings
     for st in sub_topics:
-        st["topic_id"] = _sanitize_topic_id(st["topic_id"])
         topic_text = f"{st['title']}\n\n{st['summary']}"
         embedding = embedder.embed_documents([topic_text])[0]
-        topic_doc = {
+        store.create_topic({
             "topic_id": st["topic_id"],
             "title": st["title"],
             "summary": st["summary"],
-            "tags": st.get("tags", []),
-            "suggested_directions": st.get("suggested_directions", []),
+            "tags": st.get("tags", []) if isinstance(st.get("tags"), list) else [],
+            "suggested_directions": st.get("suggested_directions", []) if isinstance(st.get("suggested_directions"), list) else [],
             "embedding": embedding,
-        }
-        store.create_topic(topic_doc)
+        })
         logger.info("Created sub-topic: %s", st["topic_id"])
 
-    # 5. Build lookup for original observations (for source metadata)
-    obs_by_url = {}
-    for obs in observations:
-        obs_by_url[obs["item_url"]] = obs
-
-    # 6. Create new observations for reassignments
-    created = 0
+    # 6. Move each observation onto its sub-topic, keeping it whole
+    obs_by_url = {obs["item_url"]: obs for obs in observations}
+    moved = 0
     for r in reassignments:
-        original_obs = obs_by_url.get(r["item_url"])
-        if not original_obs:
-            logger.warning("No original observation for %s, skipping", r["item_url"])
-            continue
-
-        new_topic_id = _sanitize_topic_id(r["new_topic_id"])
+        original = obs_by_url[r["item_url"]]
         derived = derive_strength(r.get("fit_questions"))
-        obs_doc = {
-            "item_id": original_obs.get("item_id"),
-            "item_url": r["item_url"],
-            "item_title": original_obs.get("item_title", ""),
-            "topic_id": new_topic_id,
-            "date": now,
-            "strength": derived if derived is not None else original_obs.get("strength", 0.5),
-            "connection_type": r.get(
-                "new_connection_type",
-                original_obs.get("connection_type", DEFAULT_CONNECTION_TYPE),
-            ),
+        note = (
+            f"\n\nMOVED by split-topic on {now.date().isoformat()}: from "
+            f"'{topic_id}' to '{r['new_topic_id']}'. {r.get('reasoning', '')}".rstrip()
+        )
+        updates = {
+            "topic_id": r["new_topic_id"],
+            "strength": derived if derived is not None else original.get("strength", 0.5),
+            "connection_type": r.get("new_connection_type") or original.get("connection_type", DEFAULT_CONNECTION_TYPE),
             "fit_questions": r.get("fit_questions"),
-            "reasoning_trace": r.get("reasoning", ""),
-            "source_name": original_obs.get("source_name", ""),
-            "source_type": original_obs.get("source_type", ""),
-            "entities_mentioned": original_obs.get("entities_mentioned", []),
+            "reasoning_trace": (original.get("reasoning_trace") or "") + note,
+            "moved_from": topic_id,
         }
-        store.create_observation(obs_doc)
-        created += 1
+        store.update_observation(original["_id"], updates)
+        moved += 1
 
-    # 7. Delete old observations for the original topic
-    deleted = store.delete_observations_for_topic(topic_id)
-    logger.info("Deleted %d old observations for %s", deleted, topic_id)
-
-    # 8. Retire the original topic with provenance
+    # 7. Retire the original topic with provenance
     store.update_topic(topic_id, {
         "status": "retired",
         "retired_at": now,
-        "split_into": [_sanitize_topic_id(st["topic_id"]) for st in sub_topics],
+        "split_into": [st["topic_id"] for st in sub_topics],
     })
     logger.info("Retired topic: %s", topic_id)
 
-    # 9. Compute snapshots for new sub-topics
+    # 8. Snapshots for the new sub-topics
     from topicsleuth.record import _compute_snapshot
 
     for st in sub_topics:
-        tid = _sanitize_topic_id(st["topic_id"])
-        snapshot = _compute_snapshot(store, tid, now)
-        store.append_snapshot(tid, snapshot)
+        store.append_snapshot(st["topic_id"], _compute_snapshot(store, st["topic_id"], now))
 
     return {
         "original_topic": topic["title"],
         "original_topic_id": topic_id,
         "observation_count": len(observations),
         "sub_topics_created": [st["topic_id"] for st in sub_topics],
-        "observations_reassigned": created,
-        "observations_deleted": deleted,
+        "observations_reassigned": moved,
     }
+
+
+def validate_split_plan(
+    topic_id: str,
+    observations: list[dict],
+    sub_topics: list[dict],
+    reassignments: list[dict],
+    store: Store,
+) -> list[str]:
+    """Every problem with a split plan, as sentences. Empty means the plan
+    can be executed: at least two well-formed sub-topics with distinct,
+    unused ids, and every observation assigned exactly once to one of
+    them."""
+    problems: list[str] = []
+
+    if not isinstance(sub_topics, list) or len(sub_topics) < 2:
+        problems.append(f"need at least 2 sub-topics, got {len(sub_topics) if isinstance(sub_topics, list) else 'none'}")
+        return problems
+    ids: list[str] = []
+    for st in sub_topics:
+        if not isinstance(st, dict):
+            problems.append(f"sub-topic is not an object: {st!r}")
+            continue
+        sid = st.get("topic_id") or ""
+        if not sid:
+            problems.append(f"sub-topic {st.get('title')!r} has no usable topic_id")
+            continue
+        for key in ("title", "summary"):
+            if not isinstance(st.get(key), str) or not st[key].strip():
+                problems.append(f"sub-topic {sid!r} has no {key}")
+        if sid == topic_id:
+            problems.append(f"sub-topic {sid!r} reuses the parent's id")
+        elif store.get_topic(sid) is not None:
+            problems.append(f"sub-topic id {sid!r} is already taken")
+        if sid in ids:
+            problems.append(f"sub-topic id {sid!r} is proposed twice")
+        ids.append(sid)
+    valid_ids = set(ids)
+
+    expected = {o["item_url"] for o in observations}
+    seen: dict[str, int] = {}
+    for r in reassignments:
+        if not isinstance(r, dict):
+            problems.append(f"assignment is not an object: {r!r}")
+            continue
+        url = r.get("item_url")
+        if url not in expected:
+            problems.append(f"assignment names an observation the topic does not hold: {url!r}")
+            continue
+        seen[url] = seen.get(url, 0) + 1
+        if r.get("new_topic_id") not in valid_ids:
+            problems.append(f"{url!r} is assigned to unknown sub-topic {r.get('new_topic_id')!r}")
+    for url, n in seen.items():
+        if n > 1:
+            problems.append(f"{url!r} is assigned {n} times")
+    missing = sorted(expected - set(seen))
+    if missing:
+        problems.append(f"{len(missing)} observation(s) not assigned: {missing}")
+    return problems
 
 
 def _propose_sub_topics(

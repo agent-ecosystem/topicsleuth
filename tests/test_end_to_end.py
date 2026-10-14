@@ -207,7 +207,8 @@ def test_leave_one_out_hides_the_items_own_singleton_topic():
 def test_unparseable_judge_output_is_reported_not_recorded(caplog):
     judge = ScriptedJudge(["this is not json at all"])
     decisions = synthesize_items([_item()], [_Eval("u1", E_A)], _store(), _settings(), judge, HashEmbedder(DIM))
-    assert decisions == [] and "Failed to synthesize item" in caplog.text
+    assert len(decisions) == 1 and decisions[0].decision == "failed" and "JSONDecodeError" in decisions[0].error
+    assert "Failed to synthesize item" in caplog.text
 
 
 def test_record_status_transition_and_embedding_refresh():
@@ -274,19 +275,48 @@ def test_split_topic_creates_subtopics_and_retires_parent():
     subs = {"sub_topics": [{"topic_id": "A One", "title": "A one", "summary": "s1", "tags": ["alpha"], "suggested_directions": []},
                            {"topic_id": "a-two", "title": "A two", "summary": "s2", "tags": [], "suggested_directions": []}]}
     yes, no = True, False
+    before = {o["item_url"]: o for o in st.get_observations_for_topic("a")}
     reassign = [{"item_url": "a0", "new_topic_id": "a-one", "new_connection_type": "supports", "reasoning": "r",
                  "fit_questions": {"q1_scope_expansion": yes, "q2_representative_citation": yes, "q3_distinguishing_evidence": yes}},
                 {"item_url": "a1", "new_topic_id": "a-two", "new_connection_type": "extends", "reasoning": "r",
-                 "fit_questions": {"q1_scope_expansion": yes, "q2_representative_citation": no, "q3_distinguishing_evidence": no}}]
+                 "fit_questions": {"q1_scope_expansion": yes, "q2_representative_citation": no, "q3_distinguishing_evidence": no}},
+                {"item_url": "a2", "new_topic_id": "a-two", "new_connection_type": "supports", "reasoning": "r",
+                 "fit_questions": {"q1_scope_expansion": no, "q2_representative_citation": yes, "q3_distinguishing_evidence": no}}]
     judge = ScriptedJudge([subs, reassign])
     out = split_topic("a", st, _settings(), judge, emb)
-    assert out["sub_topics_created"] == ["a-one", "a-two"] and out["observations_reassigned"] == 2 and out["observations_deleted"] == 3
+    assert out["sub_topics_created"] == ["a-one", "a-two"] and out["observations_reassigned"] == 3
     assert st.get_topic("a")["status"] == "retired" and st.get_topic("a")["split_into"] == ["a-one", "a-two"]
-    assert st.count_observations_for_topic("a-one") == 1 and st.get_observations_for_topic("a-two")[0]["strength"] == 0.5, "derived from the fit questions, not emitted"
+    assert st.count_observations_for_topic("a") == 0 and st.count_observations_for_topic("a-one") == 1 and st.count_observations_for_topic("a-two") == 2
+    moved = st.get_observations_for_topic("a-one")[0]
+    assert moved["_id"] == before["a0"]["_id"] and moved["date"] == before["a0"]["date"], "the observation is moved, not replaced"
+    assert moved.get("tags") == before["a0"].get("tags") and moved["moved_from"] == "a" and "MOVED by split-topic" in moved["reasoning_trace"]
+    assert moved["strength"] == 0.95 and moved["fit_questions"]["q2_representative_citation"] is True
+    by_url = {o["item_url"]: o for o in st.get_observations_for_topic("a-two")}
+    assert by_url["a1"]["strength"] == 0.5 and by_url["a2"]["strength"] == 0.65, "derived from the fit questions, not emitted"
     assert st.get_topic("a-one")["snapshots"][-1]["evidence_count"] == 1
-    assert st.get_observations_for_topic("a-one")[0]["strength"] == 0.95
     assert "widget manufacturing" in judge.calls[0][0] and "widget manufacturing" in judge.calls[1][0]
     assert len(emb.calls) == 2
+
+
+def test_split_rejects_an_incomplete_or_malformed_plan_before_writing():
+    from topicsleuth.split import SplitPlanError, split_topic, validate_split_plan
+    st, emb = _store(), HashEmbedder(DIM)
+    subs = {"sub_topics": [{"topic_id": "a-one", "title": "A one", "summary": "s1"},
+                           {"topic_id": "a-two", "title": "A two", "summary": "s2"}]}
+    partial = [{"item_url": "a0", "new_topic_id": "a-one"}, {"item_url": "a1", "new_topic_id": "nowhere"},
+               {"item_url": "a1", "new_topic_id": "a-two"}, {"item_url": "ghost", "new_topic_id": "a-one"}]
+    plan = split_topic("a", st, _settings(), ScriptedJudge([subs, partial]), emb, dry_run=True)
+    problems = "\n".join(plan["problems"])
+    assert "'a1' is assigned to unknown sub-topic 'nowhere'" in problems and "'a1' is assigned 2 times" in problems
+    assert "not hold: 'ghost'" in problems and "1 observation(s) not assigned: ['a2']" in problems
+    with pytest.raises(SplitPlanError):
+        split_topic("a", st, _settings(), ScriptedJudge([subs, partial]), emb)
+    assert st.count_observations_for_topic("a") == 3 and st.get_topic("a")["status"] == "emerging", "nothing written"
+    assert st.get_topic("a-one") is None and emb.calls == []
+    taken = {"sub_topics": [{"topic_id": "b", "title": "B", "summary": "s"}, {"topic_id": "a", "title": "", "summary": "s"}]}
+    problems = validate_split_plan("a", st.get_observations_for_topic("a"), taken["sub_topics"], [], st)
+    assert any("'b' is already taken" in p for p in problems) and any("reuses the parent" in p for p in problems)
+    assert any("has no title" in p for p in problems)
 
 
 def test_add_topic_and_move_observation_on_a_real_store(tmp_path):

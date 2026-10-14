@@ -102,7 +102,16 @@ result = record(items, evals, decisions, store, settings=settings, embedder=embe
 
 for obs in result.observations_created:
     print(f"{obs['item_title']} -> {obs['topic_id']} ({obs['connection_type']})")
+for failure in result.failures:        # retry these next run; do not mark them done
+    print(f"{failure.item_url} failed at {failure.stage}: {failure.error}")
 ```
+
+Recording is safe to retry. An observation is identified by its document
+and topic, so running the same batch twice, or two programs admitting the
+same document, writes it once. A document the judge or the store could
+not finish is listed in `result.failures` with the stage it stopped at,
+and nothing is written for it, so keep it in your queue and hand it over
+again next run.
 
 ## Keep track of content across days, not just today
 
@@ -402,12 +411,21 @@ topicsleuth add-topic topic.yaml --link <url>   # open a page by hand and move n
 topicsleuth move-observation <url> <topic_id>   # move one document's entry to another page
 topicsleuth reprocess-tail --max-obs 1 --older-than-days 60   # clear pages that never got a second entry
 topicsleuth seed topics.yaml                    # start an empty store from a list of topics
-topicsleuth clean --hours 28                    # undo a bad run
+topicsleuth clean --hours 28                    # remove what the last run wrote
 ```
 
-Nothing here re-judges a document. Merging and moving keep each entry's
-strength and connection type and note where it came from, and a retired
-topic keeps a pointer to what replaced it, so old links still resolve.
+Nothing here re-judges a document. Merging, moving and splitting keep each
+entry's identity, date, strength and connection type and note where it
+came from, and a retired topic keeps a pointer to what replaced it, so old
+links still resolve. A split is checked in full before anything is
+written: every entry assigned exactly once, to a sub-topic that exists.
+
+`clean` removes the observations, topics and snapshots written in a
+window, by when they were written rather than when their evidence
+happened, and with `--run-id` only what one run wrote (pass `run_id` to
+`record` and the run stamps everything it writes). It is not a full undo.
+A topic written in the window that still holds older evidence is kept,
+and a status, embedding or description a run changed is not restored.
 
 ## Bring your own content
 
@@ -455,7 +473,9 @@ synthesize:
 
 Loading history rather than today's documents? Pass `date_from_item=True`
 to `record` so entries are dated by publication rather than by the run,
-and load oldest first.
+and load oldest first. A batch dated before a topic's latest snapshot is
+inserted into its history: the snapshot counts only evidence up to its
+date, and the topic's current status is left to the newer evidence.
 
 ## Test without spending anything
 
@@ -472,8 +492,8 @@ from topicsleuth.backends.memory import MemoryStore
 The `topicsleuth` command uses the same stand-ins when
 `TOPICSLEUTH_STORE=memory`, `TOPICSLEUTH_JUDGE=scripted` and
 `TOPICSLEUTH_EMBEDDER=hash` are set, which is how its own tests run. If
-you write a store adapter, the library ships a store contract test you
-can run against it.
+you write a store adapter, the store contract test in the source tree's
+`tests/` folder (not in the wheel) runs against it.
 
 ## Where things stand
 

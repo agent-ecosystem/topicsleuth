@@ -12,6 +12,8 @@ from typing import Any
 
 import numpy as np
 
+from topicsleuth.interfaces import DuplicateObservation, DuplicateTopic
+
 
 def _aware(value):
     """The Store contract: a naive datetime written to the store is UTC,
@@ -44,10 +46,11 @@ class MemoryStore:
 
     def create_topic(self, topic_doc: dict) -> str:
         if topic_doc["topic_id"] in self.topics:
-            raise ValueError(f"duplicate topic_id: {topic_doc['topic_id']}")
+            raise DuplicateTopic(f"duplicate topic_id: {topic_doc['topic_id']}")
         now = datetime.now(timezone.utc)
         doc = _aware(dict(topic_doc))
         doc.setdefault("date_identified", now)
+        doc.setdefault("recorded_at", now)
         doc.setdefault("last_updated", now)
         doc.setdefault("status", "emerging")
         doc.setdefault("snapshots", [])
@@ -66,7 +69,11 @@ class MemoryStore:
 
     def append_snapshot(self, topic_id: str, snapshot: dict) -> None:
         t = self.topics[topic_id]
-        t.setdefault("snapshots", []).append(_aware(dict(snapshot)))
+        snapshots = t.setdefault("snapshots", [])
+        snap = _aware(dict(snapshot))
+        snap.setdefault("recorded_at", datetime.now(timezone.utc))
+        snapshots.append(snap)
+        snapshots.sort(key=lambda s: s.get("date") or datetime.min.replace(tzinfo=timezone.utc))
         t["last_updated"] = datetime.now(timezone.utc)
 
     def nearest_topics(self, embedding: list[float], limit: int) -> list[dict]:
@@ -111,9 +118,13 @@ class MemoryStore:
 
     # ── observations ──
     def create_observation(self, obs_doc: dict) -> Any:
+        key = (obs_doc.get("item_url"), obs_doc.get("topic_id"))
+        if any((o.get("item_url"), o.get("topic_id")) == key for o in self.observations.values()):
+            raise DuplicateObservation(f"observation exists for {key[0]} on {key[1]}")
         oid = next(self._ids)
         doc = _aware(dict(obs_doc))
         doc.setdefault("date", datetime.now(timezone.utc))
+        doc.setdefault("recorded_at", datetime.now(timezone.utc))
         doc["_id"] = oid
         self.observations[oid] = doc
         return oid
@@ -151,17 +162,27 @@ class MemoryStore:
         return [copy.deepcopy(self.items[u]) for u in item_urls if u in self.items]
 
     # ── maintenance ──
-    def delete_since(self, cutoff: datetime) -> dict:
+    def delete_since(self, cutoff: datetime, run_id: str | None = None) -> dict:
         c = _aware(cutoff)
-        obs = [k for k, o in self.observations.items() if o.get("date") and o["date"] >= c]
+
+        def in_window(doc: dict) -> bool:
+            stamp = doc.get("recorded_at")
+            return bool(stamp and stamp >= c and (run_id is None or doc.get("run_id") == run_id))
+
+        obs = [k for k, o in self.observations.items() if in_window(o)]
         for k in obs:
             del self.observations[k]
-        topics = [k for k, t in self.topics.items() if t.get("date_identified") and t["date_identified"] >= c]
-        for k in topics:
-            del self.topics[k]
+        deleted = kept = 0
+        for k in [k for k, t in self.topics.items() if in_window(t)]:
+            if self.count_observations_for_topic(k):
+                kept += 1
+            else:
+                del self.topics[k]
+                deleted += 1
         cleared = 0
         for t in self.topics.values():
             before = len(t.get("snapshots", []))
-            t["snapshots"] = [s for s in t.get("snapshots", []) if not (s.get("date") and s["date"] >= c)]
+            t["snapshots"] = [s for s in t.get("snapshots", []) if not in_window(s)]
             cleared += before - len(t["snapshots"])
-        return {"observations_deleted": len(obs), "topics_deleted": len(topics), "snapshots_cleared": cleared}
+        return {"observations_deleted": len(obs), "topics_deleted": deleted,
+                "topics_kept": kept, "snapshots_cleared": cleared}

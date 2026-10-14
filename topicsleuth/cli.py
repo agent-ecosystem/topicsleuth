@@ -74,32 +74,47 @@ def cmd_seed(args):
         print("Topics collection already has data, skipping seed.")
 
 
-def _preview_delete_since(store, cutoff: datetime) -> dict:
+def _preview_delete_since(store, cutoff: datetime, run_id: str | None = None) -> dict:
     """What Store.delete_since would remove, counted through the read side
     of the protocol so no adapter needs a second method for it."""
-    obs = sum(1 for o in store.list_observations() if o.get("date") and o["date"] >= cutoff)
-    topics = snapshots = 0
+    def in_window(doc: dict) -> bool:
+        stamp = doc.get("recorded_at")
+        return bool(stamp and stamp >= cutoff and (run_id is None or doc.get("run_id") == run_id))
+
+    doomed_obs = [o for o in store.list_observations() if in_window(o)]
+    doomed_keys = {(o.get("item_url"), o.get("topic_id")) for o in doomed_obs}
+    surviving_by_topic: dict[str, int] = {}
+    for o in store.list_observations():
+        if (o.get("item_url"), o.get("topic_id")) not in doomed_keys:
+            surviving_by_topic[o.get("topic_id")] = surviving_by_topic.get(o.get("topic_id"), 0) + 1
+    deleted = kept = snapshots = 0
     for t in store.list_topics():
-        if t.get("date_identified") and t["date_identified"] >= cutoff:
-            topics += 1
-        else:
-            snapshots += sum(1 for s in t.get("snapshots", []) if s.get("date") and s["date"] >= cutoff)
-    return {"observations_deleted": obs, "topics_deleted": topics, "snapshots_cleared": snapshots}
+        if in_window(t):
+            if surviving_by_topic.get(t["topic_id"]):
+                kept += 1
+            else:
+                deleted += 1
+                continue
+        snapshots += sum(1 for s in t.get("snapshots", []) if in_window(s))
+    return {"observations_deleted": len(doomed_obs), "topics_deleted": deleted,
+            "topics_kept": kept, "snapshots_cleared": snapshots}
 
 
 def cmd_clean(args):
     settings, b = _backends()
     cutoff = datetime.now(timezone.utc) - timedelta(hours=args.hours)
+    scope = f"the last {args.hours}h" + (f" by run {args.run_id}" if args.run_id else "")
     if args.dry_run:
-        result = _preview_delete_since(b.store, cutoff)
-        print(f"[DRY RUN] would remove store output from the last {args.hours}h:")
+        result = _preview_delete_since(b.store, cutoff, args.run_id)
+        print(f"[DRY RUN] would remove what was written in {scope}:")
         for k, v in result.items():
             print(f"  {k:<24} {v}")
         return
-    result = b.store.delete_since(cutoff)
-    print(f"Removed store output from the last {args.hours}h:")
+    result = b.store.delete_since(cutoff, run_id=args.run_id)
+    print(f"Removed what was written in {scope}:")
     for k, v in result.items():
         print(f"  {k:<24} {v}")
+    print("Statuses, embeddings and descriptions the run changed are not restored.")
     print("Items are the feeder's: reset their consumed markers there if they should re-run.")
 
 
@@ -130,13 +145,14 @@ def cmd_split_topic(args):
         print("  Reassignment distribution:")
         for tid, count in sorted(assigned_counts.items(), key=lambda x: -x[1]):
             print(f"    {tid}: {count} observations")
-        if result["missing_reassignments"]:
-            print(f"\n  WARNING: {len(result['missing_reassignments'])} observations not reassigned")
+        if result["problems"]:
+            print(f"\n  PLAN REJECTED, {len(result['problems'])} problem(s); nothing would be written:")
+            for problem in result["problems"]:
+                print(f"    - {problem}")
     else:
         print(f"\nSplit complete for '{result['original_topic']}':")
         print(f"  Sub-topics created:      {', '.join(result['sub_topics_created'])}")
-        print(f"  Observations reassigned: {result['observations_reassigned']}")
-        print(f"  Old observations deleted: {result['observations_deleted']}")
+        print(f"  Observations moved:      {result['observations_reassigned']}")
         print(f"  Original topic retired:  {result['original_topic_id']}")
 
 
@@ -478,12 +494,13 @@ def main():
     seed_parser.set_defaults(func=cmd_seed)
 
     clean_parser = subparsers.add_parser(
-        "clean", help="Remove observations, new topics and snapshots written in the last N hours"
+        "clean", help="Remove the observations, topics and snapshots written in the last N hours (not a full undo)"
     )
     clean_parser.add_argument(
         "--hours", type=float, default=28,
         help="Remove store output created within this many hours (default: 28)"
     )
+    clean_parser.add_argument("--run-id", type=str, default=None, help="Only what the run with this id wrote (the run_id a feeder passed to record)")
     clean_parser.add_argument("--dry-run", action="store_true", help="Count what would be removed without removing it")
     clean_parser.set_defaults(func=cmd_clean)
 

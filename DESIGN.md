@@ -104,6 +104,48 @@ same topic.
 The strength rubric is three yes/no questions mapped to a score
 downstream, never a number the model emits.
 
+## Writing safely
+
+Two feeders writing one store, and one feeder retrying after a failure,
+are the same problem: a write must mean the same thing however many times
+it lands. The rules the write path follows:
+
+- **Identity.** A topic is its `topic_id`; an observation is its
+  `(item_url, topic_id)`. Stores enforce both atomically (a unique index
+  in Mongo) and raise `DuplicateTopic` / `DuplicateObservation`, which
+  `record` treats as "already recorded": no second observation, no
+  failure, reported under `already_recorded`. A proposal whose id exists
+  with the same title is the same proposal landing twice and is reused; a
+  different title is a collision and the item fails. Synthesis picks a
+  slug no existing or batch topic uses, so collisions are rare.
+- **Failures are per item and write nothing.** A judge call that fails or
+  answers outside the contract, a proposal whose embedding fails, a topic
+  that cannot be created, a destination that no longer exists or is
+  retired, a store write that fails: each becomes an `ItemFailure` with a
+  stage, in `RecordResult.failures`, and nothing is written for that item,
+  including its embedding. `synthesize_items` carries failures as
+  decisions with `decision="failed"` so a batch is always fully accounted
+  for. A feeder acknowledges only the items outside `failed_urls()`; the
+  rest are retried, and idempotency makes the retry safe.
+- **The judge's answer is validated before it is written.** Decision and
+  connection type must be known values, a link must name a shown
+  candidate and carry the fit answers (or come from the gate or the
+  reviewer), a proposal must have a title, summary and slug, and
+  classifications of topics the judge was not shown are dropped before
+  the gate reads them. The write boundary re-checks that the destination
+  exists and is not retired.
+- **History reads as history.** A snapshot counts only evidence dated at
+  or before its date, snapshots are kept in date order by the store, and a
+  batch dated before a topic's latest snapshot is inserted without
+  changing the topic's current status. Topics founded after the batch's
+  date are not status-checked by it.
+- **Removal, not undo.** Every topic, observation and snapshot carries
+  `recorded_at` (ingestion time, stamped by the store) and optionally the
+  `run_id` the feeder passed. `delete_since` removes by those, keeps a
+  topic that still holds evidence from outside the window, and restores
+  nothing it did not write. Run-scoped undo of status and embedding
+  changes would need a journal; this is deliberately the smaller promise.
+
 ## Tuning
 
 `tune synthesize` replays the decision against recorded items without

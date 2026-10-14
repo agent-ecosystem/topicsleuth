@@ -15,7 +15,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from topicsleuth.interfaces import StoreError
+from topicsleuth.interfaces import DuplicateObservation, DuplicateTopic, StoreError
 
 DEFAULT_COLLECTIONS = {"topics": "topics", "observations": "observations", "items": "items"}
 
@@ -47,6 +47,11 @@ class MongoStore:
         self.num_candidates = num_candidates
         try:
             self.topics.create_index("topic_id", unique=True)
+            # Observation identity: one per (item_url, topic_id). The unique
+            # index is what makes a retried or doubly-fed batch safe.
+            self.observations.create_index(
+                [("item_url", ASCENDING), ("topic_id", ASCENDING)], unique=True, name="item_url_topic_id_unique",
+            )
             self.observations.create_index([("item_id", ASCENDING), ("topic_id", ASCENDING)])
             self.observations.create_index("topic_id")
         except OperationFailure as e:
@@ -70,12 +75,17 @@ class MongoStore:
     def create_topic(self, topic_doc: dict) -> str:
         now = datetime.now(timezone.utc)
         topic_doc.setdefault("date_identified", now)
+        topic_doc.setdefault("recorded_at", now)
         topic_doc.setdefault("last_updated", now)
         topic_doc.setdefault("status", "emerging")
         topic_doc.setdefault("snapshots", [])
         topic_doc.setdefault("entities", [])
         topic_doc.setdefault("suggested_directions", [])
-        self.topics.insert_one(topic_doc)
+        from pymongo.errors import DuplicateKeyError
+        try:
+            self.topics.insert_one(topic_doc)
+        except DuplicateKeyError as e:
+            raise DuplicateTopic(f"duplicate topic_id: {topic_doc['topic_id']}") from e
         return topic_doc["topic_id"]
 
     def update_topic(self, topic_id: str, updates: dict) -> None:
@@ -86,9 +96,11 @@ class MongoStore:
         return self.topics.delete_one({"topic_id": topic_id}).deleted_count > 0
 
     def append_snapshot(self, topic_id: str, snapshot: dict) -> None:
+        snapshot = {"recorded_at": datetime.now(timezone.utc), **snapshot}
         self.topics.update_one(
             {"topic_id": topic_id},
-            {"$push": {"snapshots": snapshot}, "$set": {"last_updated": datetime.now(timezone.utc)}},
+            {"$push": {"snapshots": {"$each": [snapshot], "$sort": {"date": 1}}},
+             "$set": {"last_updated": datetime.now(timezone.utc)}},
         )
 
     def nearest_topics(self, embedding: list[float], limit: int) -> list[dict]:
@@ -124,8 +136,15 @@ class MongoStore:
 
     # ── observations ──
     def create_observation(self, obs_doc: dict) -> Any:
+        from pymongo.errors import DuplicateKeyError
         obs_doc.setdefault("date", datetime.now(timezone.utc))
-        return self.observations.insert_one(obs_doc).inserted_id
+        obs_doc.setdefault("recorded_at", datetime.now(timezone.utc))
+        try:
+            return self.observations.insert_one(obs_doc).inserted_id
+        except DuplicateKeyError as e:
+            raise DuplicateObservation(
+                f"observation exists for {obs_doc.get('item_url')} on {obs_doc.get('topic_id')}"
+            ) from e
 
     def get_observations_for_topic(self, topic_id: str) -> list[dict]:
         return list(self.observations.find({"topic_id": topic_id}))
@@ -167,10 +186,24 @@ class MongoStore:
         return random.Random(seed).sample(pool, min(n, len(pool)))
 
     # ── maintenance ──
-    def delete_since(self, cutoff: datetime) -> dict:
-        c = cutoff  # pymongo encodes an aware datetime as UTC; a naive one is taken as UTC
-        obs = self.observations.delete_many({"date": {"$gte": c}}).deleted_count
-        older = [t["topic_id"] for t in self.topics.find({"date_identified": {"$lt": c}}, {"topic_id": 1})]
-        topics = self.topics.delete_many({"date_identified": {"$gte": c}}).deleted_count
-        self.topics.update_many({"topic_id": {"$in": older}}, {"$pull": {"snapshots": {"date": {"$gte": c}}}})
-        return {"observations_deleted": obs, "topics_deleted": topics, "snapshots_cleared_on": len(older)}
+    def delete_since(self, cutoff: datetime, run_id: str | None = None) -> dict:
+        # pymongo encodes an aware datetime as UTC; a naive one is taken as UTC.
+        window: dict = {"recorded_at": {"$gte": cutoff}}
+        if run_id is not None:
+            window["run_id"] = run_id
+        obs = self.observations.delete_many(window).deleted_count
+        deleted = kept = 0
+        for t in self.topics.find(window, {"topic_id": 1}):
+            if self.count_observations_for_topic(t["topic_id"]):
+                kept += 1
+            else:
+                self.topics.delete_one({"topic_id": t["topic_id"]})
+                deleted += 1
+        snap_window = {"recorded_at": {"$gte": cutoff}}
+        if run_id is not None:
+            snap_window["run_id"] = run_id
+        before = sum(len(t.get("snapshots") or []) for t in self.topics.find({}, {"snapshots": 1}))
+        self.topics.update_many({}, {"$pull": {"snapshots": snap_window}})
+        after = sum(len(t.get("snapshots") or []) for t in self.topics.find({}, {"snapshots": 1}))
+        return {"observations_deleted": obs, "topics_deleted": deleted,
+                "topics_kept": kept, "snapshots_cleared": before - after}

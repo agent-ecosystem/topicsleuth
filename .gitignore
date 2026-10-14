@@ -6,6 +6,7 @@ dist/
 build/
 .env
 tuning_runs/
+.coverage
 # A store's label set and replay baselines describe its content; keep them
 # with the feeder that owns the store, never here.
 data/labels/

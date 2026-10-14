@@ -138,17 +138,48 @@ def test_item_embeddings_round_trip(store):
 
 def test_delete_since(store):
     then = datetime.now(timezone.utc) - timedelta(days=3)
-    store.create_topic({"topic_id": "old", "date_identified": then})
+    store.create_topic({"topic_id": "old", "date_identified": then, "recorded_at": then})
     store.create_topic({"topic_id": "new"})
-    store.create_observation({"topic_id": "old", "item_url": "u1", "date": then})
+    store.create_topic({"topic_id": "kept"})
+    store.create_observation({"topic_id": "old", "item_url": "u1", "date": then, "recorded_at": then})
     store.create_observation({"topic_id": "old", "item_url": "u2"})
-    store.append_snapshot("old", {"date": then, "evidence_count": 1})
+    store.create_observation({"topic_id": "kept", "item_url": "u3", "recorded_at": then}, )
+    store.create_observation({"topic_id": "old", "item_url": "u4", "run_id": "r2"})
+    store.append_snapshot("old", {"date": then, "evidence_count": 1, "recorded_at": then})
     store.append_snapshot("old", {"date": datetime.now(timezone.utc), "evidence_count": 2})
-    result = store.delete_since(datetime.now(timezone.utc) - timedelta(days=1))
-    assert result["observations_deleted"] == 1 and result["topics_deleted"] == 1
+    cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+    scoped = store.delete_since(cutoff, run_id="r2")
+    assert scoped["observations_deleted"] == 1 and scoped["topics_deleted"] == 0
+    assert sorted(o["item_url"] for o in store.list_observations()) == ["u1", "u2", "u3"]
+    result = store.delete_since(cutoff)
+    assert result == {"observations_deleted": 1, "topics_deleted": 1, "topics_kept": 1, "snapshots_cleared": 1}
     assert store.get_topic("new") is None and store.get_topic("old") is not None
+    assert store.get_topic("kept") is not None, "a topic recorded in the window but holding older evidence is kept"
     assert [s["evidence_count"] for s in store.get_topic("old")["snapshots"]] == [1]
-    assert [o["item_url"] for o in store.list_observations()] == ["u1"]
+    assert sorted(o["item_url"] for o in store.list_observations()) == ["u1", "u3"]
+
+
+def test_observation_identity_is_one_per_item_and_topic(store):
+    from topicsleuth.interfaces import DuplicateObservation, DuplicateTopic
+    _seed(store)
+    store.create_observation({"topic_id": "a", "item_url": "u1"})
+    with pytest.raises(DuplicateObservation):
+        store.create_observation({"topic_id": "a", "item_url": "u1", "strength": 0.9})
+    store.create_observation({"topic_id": "b", "item_url": "u1"}), "the same item on another topic is a different observation"
+    assert store.count_observations_for_topic("a") == 1
+    with pytest.raises(DuplicateTopic):
+        store.create_topic({"topic_id": "a", "title": "again"})
+
+
+def test_snapshots_are_kept_in_date_order(store):
+    _seed(store)
+    now = datetime.now(timezone.utc)
+    store.append_snapshot("a", {"date": now, "evidence_count": 3})
+    store.append_snapshot("a", {"date": now - timedelta(days=2), "evidence_count": 1})
+    store.append_snapshot("a", {"date": now - timedelta(days=1), "evidence_count": 2})
+    snaps = store.get_topic("a")["snapshots"]
+    assert [s["evidence_count"] for s in snaps] == [1, 2, 3]
+    assert all("recorded_at" in s for s in snaps)
 
 
 def test_datetimes_come_back_timezone_aware(store):

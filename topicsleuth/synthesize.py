@@ -10,6 +10,8 @@ from topicsleuth.interfaces import DecisionModel, Embedder, Judge, Store
 from topicsleuth.settings import Settings
 from topicsleuth.rubric import (
     CONFIRM_LINK_STRENGTH,
+    CONNECTION_TYPES,
+    DECISIONS,
     DEFAULT_CONNECTION_TYPE,
     GATE_OVERRIDE_DEFAULT_STRENGTH,
     REVIEWER_CONNECTION_TYPE,
@@ -34,11 +36,17 @@ class ItemEval(Protocol):
 
 logger = logging.getLogger(__name__)
 
+class DecisionError(ValueError):
+    """The judge's answer parsed but does not satisfy the response contract:
+    an unknown decision, a link to a topic it was not shown, a proposal with
+    no title. The item is reported as failed, never written."""
+
+
 @dataclass
 class SynthesisDecision:
     item_url: str
     item_title: str
-    decision: str  # link_existing, propose_new, skip
+    decision: str  # link_existing, propose_new, skip, or failed
     topic_id: str | None
     connection_type: str | None
     strength: float
@@ -47,6 +55,17 @@ class SynthesisDecision:
     # Non-persisted retrieval/prompt facts for the tuning harness: candidate
     # counts per channel, vector scores, token usage, classification labels.
     diagnostics: dict | None = None
+    # Set when decision is "failed": what went wrong, so the caller can
+    # retry the item instead of acknowledging it.
+    error: str | None = None
+
+
+def failed_decision(item: dict, error: BaseException | str) -> SynthesisDecision:
+    text = error if isinstance(error, str) else f"{type(error).__name__}: {error}"
+    return SynthesisDecision(
+        item_url=item["url"], item_title=item.get("title", ""), decision="failed",
+        topic_id=None, connection_type=None, strength=0.0, reasoning_trace="", error=text,
+    )
 
 
 def _find_tag_overlap_topics(
@@ -349,6 +368,102 @@ def _robust_json_parse(raw_text: str) -> dict:
         raw_text,
         0,
     )
+
+
+def _drop_unshown_classifications(parsed: dict, shown_ids: set[str]) -> dict:
+    """Keep only classifications of topics the judge was actually shown. A
+    fabricated same_question entry would otherwise let the gate force a link
+    to a topic that does not exist."""
+    classifications = parsed.get("candidate_classifications")
+    if not isinstance(classifications, list):
+        parsed["candidate_classifications"] = []
+        return parsed
+    kept, dropped = [], []
+    for c in classifications:
+        if isinstance(c, dict) and _sanitize_topic_id(str(c.get("topic_id") or "")) in shown_ids:
+            c["topic_id"] = _sanitize_topic_id(str(c["topic_id"]))
+            kept.append(c)
+        else:
+            dropped.append(c.get("topic_id") if isinstance(c, dict) else c)
+    if dropped:
+        logger.warning("Judge classified topics it was not shown; ignored: %s", dropped)
+        parsed["reasoning_trace"] = (
+            (parsed.get("reasoning_trace") or "")
+            + f"\n\nIGNORED: classifications of unshown topics {dropped}"
+        )
+    parsed["candidate_classifications"] = kept
+    return parsed
+
+
+def _unique_topic_id(topic_id: str, store: Store, proposed_topics: list[dict]) -> str:
+    """A slug no existing or batch-proposed topic already uses."""
+    taken = {t["topic_id"] for t in proposed_topics}
+    candidate, n = topic_id, 1
+    while candidate in taken or store.get_topic(candidate) is not None:
+        n += 1
+        candidate = f"{topic_id}-{n}"
+    return candidate
+
+
+def _validate_decision(parsed: dict, shown_ids: set[str], store: Store, proposed_topics: list[dict]) -> dict:
+    """Enforce the response contract on a parsed decision. Raises
+    DecisionError for anything that must not be written; normalizes the
+    rest (connection type, proposal fields, slug uniqueness)."""
+    decision = parsed.get("decision")
+    if decision not in DECISIONS:
+        raise DecisionError(f"unknown decision {decision!r}")
+
+    if decision == "link_existing":
+        topic_id = parsed.get("topic_id")
+        if not topic_id or topic_id not in shown_ids:
+            raise DecisionError(f"link to {topic_id!r}, which was not among the shown candidates")
+        scored = (
+            derive_strength(parsed.get("fit_questions")) is not None
+            or parsed.get("gate_override")
+            or parsed.get("confirmation") == "overridden_to_link"
+        )
+        if not scored:
+            raise DecisionError("link_existing without the three fit questions answered")
+        strength = parsed.get("strength")
+        if not isinstance(strength, (int, float)) or strength != strength or not 0.0 <= strength <= 1.0:
+            raise DecisionError(f"strength {strength!r} is not a number in [0, 1]")
+        ctype = parsed.get("connection_type")
+        if ctype is None:
+            parsed["connection_type"] = DEFAULT_CONNECTION_TYPE
+        elif ctype not in CONNECTION_TYPES:
+            raise DecisionError(f"unknown connection_type {ctype!r}")
+        parsed["new_topic"] = None
+
+    elif decision == "propose_new":
+        new_topic = parsed.get("new_topic")
+        if not isinstance(new_topic, dict):
+            raise DecisionError("propose_new without a new_topic")
+        for key in ("title", "summary"):
+            if not isinstance(new_topic.get(key), str) or not new_topic[key].strip():
+                raise DecisionError(f"proposed topic has no {key}")
+        slug = _sanitize_topic_id(str(new_topic.get("topic_id") or ""))
+        if not slug:
+            raise DecisionError("proposed topic has no usable topic_id")
+        unique = _unique_topic_id(slug, store, proposed_topics)
+        if unique != slug:
+            logger.info("Proposed topic_id %s is taken; using %s", slug, unique)
+            parsed["reasoning_trace"] = (
+                (parsed.get("reasoning_trace") or "") + f"\n\nTOPIC ID: '{slug}' is taken; created as '{unique}'"
+            )
+        new_topic["topic_id"] = unique
+        for key in ("tags", "suggested_directions"):
+            value = new_topic.get(key)
+            new_topic[key] = [str(v) for v in value] if isinstance(value, list) else []
+        parsed["topic_id"] = None
+        parsed["connection_type"] = None
+
+    else:  # skip
+        parsed["topic_id"] = None
+        parsed["connection_type"] = None
+        parsed["new_topic"] = None
+        parsed["strength"] = 0.0
+
+    return parsed
 
 
 def _enforce_link_gate(parsed: dict, all_candidates: list[dict]) -> dict:
@@ -804,6 +919,8 @@ def synthesize_item(
 
     response = judge.complete(system, user_content, max_tokens=2048)
     parsed = _parse_decision(response.text)
+    shown_ids = {c["topic_id"] for c in all_candidates if c.get("topic_id")}
+    parsed = _drop_unshown_classifications(parsed, shown_ids)
     parsed = _enforce_link_gate(parsed, all_candidates)
 
     confirm_response = None
@@ -822,6 +939,8 @@ def synthesize_item(
                 parsed, item_text, vector_candidates, all_candidates,
                 store, settings, judge, exclude_url,
             )
+
+    parsed = _validate_decision(parsed, shown_ids, store, proposed_topics)
 
     diagnostics = _build_diagnostics(
         parsed, vector_candidates, tag_candidates, candidates, proposed_topics,
@@ -954,24 +1073,28 @@ def synthesize_items(
                 item, eval_result, store, settings, judge, proposed_topics,
                 decision_model=decision_model,
             )
-            decisions.append(decision)
+        except Exception as e:
+            # A failed item is still a decision, with decision="failed", so
+            # the caller can see it, keep it in the queue, and retry it.
+            logger.error("Failed to synthesize item: %s", item.get("url"), exc_info=True)
+            decisions.append(failed_decision(item, e))
+            continue
 
-            # Track proposed topics so subsequent items can link to them.
-            # The embedding is set on decision.new_topic directly so record.py
-            # persists it; proposed_topics references the same dict.
-            if decision.decision == "propose_new" and decision.new_topic:
-                topic_text = (
-                    f"{decision.new_topic['title']}\n\n"
-                    f"{decision.new_topic['summary']}"
-                )
+        # A proposal is not a proposal until its embedding exists: later
+        # items are matched against it and record persists it. The
+        # embedding is set on decision.new_topic directly; proposed_topics
+        # references the same dict.
+        if decision.decision == "propose_new" and decision.new_topic:
+            topic_text = f"{decision.new_topic['title']}\n\n{decision.new_topic['summary']}"
+            try:
                 decision.new_topic["embedding"] = embedder.embed_documents([topic_text])[0]
-                proposed_topics.append(decision.new_topic)
+            except Exception as e:
+                logger.error("Failed to embed proposed topic for %s", item.get("url"), exc_info=True)
+                decisions.append(failed_decision(item, f"embed_proposal: {type(e).__name__}: {e}"))
+                continue
+            proposed_topics.append(decision.new_topic)
 
-            logger.info("  decision=%s topic=%s", decision.decision, decision.topic_id)
-
-        except Exception:
-            logger.error(
-                "Failed to synthesize item: %s", item.get("url"), exc_info=True
-            )
+        decisions.append(decision)
+        logger.info("  decision=%s topic=%s", decision.decision, decision.topic_id)
 
     return decisions

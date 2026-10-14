@@ -20,12 +20,13 @@ class _VoyageResponse:
 
 
 class _VoyageClient:
-    def __init__(self):
+    def __init__(self, width=4):
         self.calls = []
+        self.width = width
 
-    def embed(self, texts, model, input_type):
-        self.calls.append((list(texts), model, input_type))
-        return _VoyageResponse([[float(len(t))] * 4 for t in texts])
+    def embed(self, texts, model, input_type, output_dimension):
+        self.calls.append((list(texts), model, input_type, output_dimension))
+        return _VoyageResponse([[float(len(t))] * self.width for t in texts])
 
 
 def test_voyage_embedder_maps_documents_and_queries():
@@ -38,8 +39,28 @@ def test_voyage_embedder_maps_documents_and_queries():
     assert e.embed_documents(["ab", "c"]) == [[2.0] * 4, [1.0] * 4]
     assert e.embed_queries(["ab"]) == [[2.0] * 4]
     assert e.embed_documents([]) == [] and len(client.calls) == 2
-    assert client.calls[0] == (["ab", "c"], "voyage-x", "document")
-    assert client.calls[1] == (["ab"], "voyage-x", "query")
+    assert client.calls[0] == (["ab", "c"], "voyage-x", "document", 4), "the dimensionality is requested, not assumed"
+    assert client.calls[1] == (["ab"], "voyage-x", "query", 4)
+
+
+def test_voyage_embedder_rejects_vectors_of_the_wrong_shape():
+    pytest.importorskip("voyageai")
+    from topicsleuth.backends.voyage import VoyageEmbedder
+    wrong = VoyageEmbedder(model="voyage-x", dimensions=256, client=_VoyageClient(width=1024))
+    with pytest.raises(ValueError, match="1024-dimensional vector; this embedder is 256"):
+        wrong.embed_documents(["ab"])
+
+    class _Short(_VoyageClient):
+        def embed(self, texts, model, input_type, output_dimension):
+            return _VoyageResponse([[1.0] * 4])
+    with pytest.raises(ValueError, match="returned 1 embeddings for 2 texts"):
+        VoyageEmbedder(dimensions=4, client=_Short()).embed_documents(["a", "b"])
+
+    class _Nan(_VoyageClient):
+        def embed(self, texts, model, input_type, output_dimension):
+            return _VoyageResponse([[float("nan")] * 4])
+    with pytest.raises(ValueError, match="non-finite"):
+        VoyageEmbedder(dimensions=4, client=_Nan()).embed_documents(["a"])
 
 
 # ── Anthropic ──

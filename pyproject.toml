@@ -54,7 +54,7 @@ build-backend = "setuptools.build_meta"
 include = ["topicsleuth*"]
 
 [tool.setuptools.package-data]
-topicsleuth = ["config/*.yaml"]
+topicsleuth = ["config/*.yaml", "py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

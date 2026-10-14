@@ -116,13 +116,36 @@ def _rubric_from_raw(raw: dict[str, Any]) -> RubricConfig:
     return RubricConfig(**raw)
 
 
+def _section(cls, raw: dict[str, Any], name: str):
+    """Build a settings section, naming any key the section does not have.
+    A misspelled or misplaced key must not fall back to a default silently:
+    two feeders would then run on different rules while believing they
+    share one file."""
+    values = raw.get(name) or {}
+    if not isinstance(values, dict):
+        raise ValueError(f"settings section {name!r} must be a mapping")
+    known = {f.name for f in fields(cls)}
+    unknown = set(values) - known
+    if unknown:
+        raise ValueError(f"unknown settings under {name!r}: {sorted(unknown)}; known: {sorted(known)}")
+    return cls(**values)
+
+
 def _from_raw(raw: dict[str, Any]) -> Settings:
+    known = {f.name for f in fields(Settings)}
+    unknown = set(raw) - known
+    if unknown:
+        raise ValueError(
+            f"unknown top-level settings: {sorted(unknown)}; known: {sorted(known)}. "
+            "A feeder's own settings belong in its own file; the file given to "
+            "topicsleuth holds only the store's decision settings."
+        )
     return Settings(
         domain=raw.get("domain", Settings.domain),
         rubric=_rubric_from_raw(raw.get("rubric") or {}),
-        embedding=EmbeddingConfig(**raw.get("embedding", {})),
-        candidates=CandidateConfig(**raw.get("candidates", {})),
-        synthesize=SynthesizeConfig(**raw.get("synthesize", {})),
+        embedding=_section(EmbeddingConfig, raw, "embedding"),
+        candidates=_section(CandidateConfig, raw, "candidates"),
+        synthesize=_section(SynthesizeConfig, raw, "synthesize"),
     )
 
 

@@ -22,6 +22,27 @@ class StoreError(RuntimeError):
     """A store could not be reached or refused the operation."""
 
 
+class DuplicateTopic(StoreError):
+    """create_topic was given a topic_id the store already holds."""
+
+
+class DuplicateObservation(StoreError):
+    """create_observation was given an (item_url, topic_id) pair the store
+    already holds. Recording treats this as "already recorded", which is
+    what makes a retried batch safe."""
+
+
+@dataclass
+class ItemFailure:
+    """One item the pipeline could not finish. ``stage`` names where it
+    stopped (synthesize, embed_proposal, create_topic, create_observation,
+    save_embedding); the item should be retried, not acknowledged."""
+
+    item_url: str
+    stage: str
+    error: str
+
+
 @runtime_checkable
 class Embedder(Protocol):
     """Turns text into vectors. ``dimensions`` must match what the store's
@@ -91,13 +112,25 @@ class Store(Protocol):
     (written at record time, read back for the centroid refresh) and
     fetching items by URL for replays.
 
-    Documents are plain dicts. ``topic_id`` identifies a topic;
-    observations carry ``topic_id`` and ``item_url``. A store returns its
-    own identifier for a created observation.
+    Documents are plain dicts. ``topic_id`` identifies a topic and is
+    unique: ``create_topic`` raises ``DuplicateTopic`` on a collision. An
+    observation is identified by ``(item_url, topic_id)`` and a store holds
+    at most one: ``create_observation`` raises ``DuplicateObservation`` on
+    a collision, atomically, so two writers cannot both insert the same
+    evidence. A store returns its own identifier for a created observation.
 
     Every datetime a store hands back is timezone-aware, in UTC. A store
     given a naive datetime treats it as UTC. The library does its date
     arithmetic on that contract and never normalizes what a store returns.
+
+    A topic's ``snapshots`` are kept in order of their ``date``, whatever
+    order they were appended in, so a history load that writes an older
+    snapshot after a newer one still reads as a sequence.
+
+    Every topic, observation and snapshot carries ``recorded_at``, when it
+    was written, which a store stamps itself if the caller did not. It is
+    distinct from ``date`` and ``date_identified``, which are when the
+    evidence happened, and it is what ``delete_since`` works from.
     """
 
     # ── topics ──
@@ -146,8 +179,15 @@ class Store(Protocol):
     def get_items(self, item_urls: list[str]) -> list[dict]: ...
 
     # ── maintenance ──
-    def delete_since(self, cutoff: datetime) -> dict:
-        """Remove observations and topics created at or after ``cutoff`` and
-        clear snapshots taken since then on older topics. For undoing a bad
-        run. Returns counts."""
+    def delete_since(self, cutoff: datetime, run_id: str | None = None) -> dict:
+        """Remove what runs wrote at or after ``cutoff``: observations and
+        topics by their ``recorded_at`` stamp, and snapshots by theirs. With
+        ``run_id``, only documents that run stamped. A topic in the window
+        that still holds observations from outside it (evidence moved onto
+        it, or recorded earlier) is kept, not deleted, and counted under
+        ``topics_kept``. Returns counts: observations_deleted,
+        topics_deleted, topics_kept, snapshots_cleared.
+
+        This removes documents; it does not restore a status, embedding or
+        description a run changed."""
         ...
