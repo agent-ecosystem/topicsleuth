@@ -86,6 +86,71 @@ class SynthesisDecision:
     error: str | None = None
 
 
+def intended_links(observations: list[dict], store: Store) -> list[Link]:
+    """The decision an item's stored observations still call for, resolved
+    against what curation has done since.
+
+    Each observation records the whole decision under ``decision_links``
+    (an observation without the field is its own intent); the union of
+    those copies is the plan. A plan is not revised by curation, so it is
+    read against curation's own marks:
+
+    - a topic any of the item's observations was ``moved_from`` or
+      ``folded_from`` was deliberately taken off the item (a move, merge
+      or split); it is not unfinished work, whatever the plan says;
+    - a planned topic the item is not yet on is followed through merges
+      (``merged_into``) to its live successor, and dropped if that successor
+      is already present, or if the topic was deleted, retired by a split,
+      or is being deleted.
+
+    The result is every link the item has, plus every planned link that is
+    still writable and was not removed on purpose, in first-seen order."""
+    present: dict[str, Link] = {}
+    planned: dict[str, Link] = {}
+    removed: set[str] = set()
+    for o in observations:
+        tid = o.get("topic_id")
+        if tid and tid not in present:
+            present[tid] = Link(topic_id=tid, connection_type=o.get("connection_type") or DEFAULT_CONNECTION_TYPE,
+                                strength=o.get("strength") if o.get("strength") is not None else 0.0,
+                                fit_questions=o.get("fit_questions"))
+        if o.get("moved_from"):
+            removed.add(o["moved_from"])
+        removed.update(o.get("folded_from") or [])
+        for l in o.get("decision_links") or []:
+            pid = l.get("topic_id")
+            if pid and pid not in planned:
+                planned[pid] = Link(topic_id=pid, connection_type=l.get("connection_type") or DEFAULT_CONNECTION_TYPE,
+                                    strength=l.get("strength") if l.get("strength") is not None else 0.0,
+                                    fit_questions=l.get("fit_questions"))
+
+    links: dict[str, Link] = dict(present)
+    for pid, link in planned.items():
+        if pid in links or pid in removed:
+            continue
+        target = _live_successor(pid, store)
+        if target is None or target in links or target in removed:
+            continue
+        links[target] = Link(topic_id=target, connection_type=link.connection_type,
+                             strength=link.strength, fit_questions=link.fit_questions)
+    return list(links.values())
+
+
+def _live_successor(topic_id: str, store: Store) -> str | None:
+    """Follow merges to the topic that now holds what ``topic_id`` tracked.
+    None if it was deleted, is being deleted, or was retired by a split."""
+    seen: set[str] = set()
+    while topic_id and topic_id not in seen:
+        seen.add(topic_id)
+        topic = store.get_topic(topic_id)
+        if topic is None or topic.get("status") == "deleting":
+            return None
+        if topic.get("status") != "retired":
+            return topic_id
+        topic_id = topic.get("merged_into")
+    return None
+
+
 def failed_decision(item: dict, error: BaseException | str) -> SynthesisDecision:
     text = error if isinstance(error, str) else f"{type(error).__name__}: {error}"
     return SynthesisDecision(
@@ -916,7 +981,7 @@ def synthesize_item(
     # Find candidates via vector search (filter retired post-query)
     vector_candidates = [
         t for t in store.nearest_topics(eval_result.embedding, settings.candidates.vector_limit)
-        if t.get("status") != "retired" and t["topic_id"] not in hidden_topic_ids
+        if t.get("status") not in ("retired", "deleting") and t["topic_id"] not in hidden_topic_ids
     ]
     if not vector_candidates and all_topics:
         # Atlas answers a missing or misnamed vector index with an empty
@@ -1133,8 +1198,7 @@ def synthesize_items(
         # retry cannot pick a different topic or open a second one.
         existing = store.get_observations_for_item(item["url"])
         if existing:
-            links = [Link(topic_id=o["topic_id"], connection_type=o.get("connection_type") or DEFAULT_CONNECTION_TYPE,
-                          strength=o.get("strength") or 0.0, fit_questions=o.get("fit_questions")) for o in existing]
+            links = intended_links(existing, store)
             logger.info("  already recorded on %s; not re-judged", [l.topic_id for l in links])
             decisions.append(SynthesisDecision(
                 item_url=item["url"], item_title=item.get("title", ""), decision="link_existing",

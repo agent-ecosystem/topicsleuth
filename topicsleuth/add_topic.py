@@ -160,6 +160,9 @@ def move_observations(
             )
             store.update_observation(holder["_id"], {
                 "reasoning_trace": (holder.get("reasoning_trace") or "") + note,
+                # Curation took this item off ``src``: a retry must not read
+                # the item's plan as still calling for it.
+                "folded_from": sorted(set(holder.get("folded_from") or []) | {src}),
             })
             store.delete_observation(o["_id"])
             logger.info("Folded duplicate observation of %s from %s into %s", o["item_url"], src, target_topic_id)

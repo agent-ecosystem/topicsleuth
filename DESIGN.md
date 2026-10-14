@@ -125,12 +125,21 @@ it lands. The rules the write path follows:
   and applies none of this batch's links for it, so a retry cannot choose
   different topics or open a second one, and two feeders deciding
   differently about one document leave the first writer's observations.
-  The loser of that race removes the empty topic it opened. One
-  consequence: if a store write fails for one link after a sibling link
-  landed, the item is reported failed, but the retry sees the item as
-  recorded and does not add the missing link. Merges and moves fold an
-  item already on the target into the target's observation, noted in its
-  trace. A proposal whose id exists with the same title is reused; a
+  The loser of that race removes the empty topic it opened. Every
+  observation carries the whole decision it was part of, under
+  `decision_links`, so the intended link set is durable from the first
+  write: a retry reads it back from any one observation and writes the
+  links that are missing, and an item is not clear of `failed_urls()`
+  until every intended link is in the store. Curation does not rewrite
+  those copies; the plan is read against curation's own marks instead. A
+  topic any of the item's observations was `moved_from` or `folded_from`
+  was taken off the item on purpose and is never revived. A planned topic
+  the item is not yet on is followed through merges to its live successor,
+  and dropped if that successor is already present or the topic was
+  deleted, retired by a split, or is being deleted. Whether a later batch
+  may add links to a recorded item is a separate policy, and the answer
+  today is no. Merges and moves fold an item already on the target into the
+  target's observation, noted in its trace. A proposal whose id exists with the same title is reused; a
   different title is a collision and the item fails. Synthesis picks a slug
   no existing or batch topic uses.
 - **Failures are per item, and a retry finishes the work.** A judge call
@@ -162,17 +171,38 @@ it lands. The rules the write path follows:
   so the series and the latest count the judge is shown include the
   backfill. Topics founded after the batch's date are not status-checked
   by it.
-- **Ingestion and maintenance do not lock each other out.** Merge, split,
-  move, reprocess and clean may run while a feeder records. Recording
-  re-reads its destination after the insert: if the topic was merged
-  meanwhile the observation follows the merge, and if it was retired by a
-  split or deleted the observation is withdrawn and the item fails, to be
-  re-judged against the new topics next run. Reprocess deletes the topic
-  before its observations so an insert in the gap sees it gone. Merge and
-  split, after retiring their source, carry along anything that arrived on
-  it while they ran (split by nearest sub-topic embedding). The window is
-  one read and one write wide on either side, and both sides check, which
-  is cheaper than a lock and needs nothing from an adapter.
+- **Ingestion and maintenance coordinate through the topic's status, not
+  a lock.** Merge, split, move, reprocess and clean may run while a feeder
+  records. Each maintenance operation marks the topic before it decides:
+  merge and split set `retired` (with `merged_into` or `split_into`),
+  clean and reprocess set `deleting` before counting or deleting. Recording
+  refuses a marked destination before the insert and re-reads it after:
+  if the topic was merged meanwhile the observation follows the merge; if
+  it was retired by a split, marked for deletion or deleted, the
+  observation is withdrawn and the item fails, to be re-judged next run.
+  Clean keeps a topic whose count, taken after the mark, is not zero, and
+  restores its status. The mark keeps the prior status on the topic
+  document, so a cleanup that fails or crashes after marking can be
+  finished by anyone: `recover_interrupted_deletions` restores a marked
+  topic that still holds evidence and deletes one that does not, and the
+  clean and reprocess commands run it first. Merge and split carry along
+  anything that landed on their source before the mark. This is not atomicity: the one write both
+  sides see, the status, is what orders them. An insert whose post-check
+  beat the mark is counted by the maintenance side, because the mark
+  precedes the count; one that did not is refused by the post-check. No
+  adapter needs more than a status field for this.
+- **Derived state retries until it lands.** The snapshot, the later
+  snapshots a backfill recomputes, the status, the item embedding and the
+  topic's embedding refresh are each derived from the store and safe to
+  repeat. A failure in any of them fails the items that caused it; the
+  retry, finding the observation, redoes whichever is missing. The refresh
+  is the one stage whose trigger (a count crossing a threshold) happens
+  once, so a failed or deferred refresh leaves `embedding_refresh_pending`
+  on the topic and the next run that touches it tries again. A refresh
+  also waits for its inputs: it runs after the batch's item embeddings
+  are saved, and is deferred, not skipped, while an embedding this batch
+  owes the topic failed to save, so it is never computed from incomplete
+  inputs and then taken as done.
 - **Removal, not undo.** Every topic, observation and snapshot carries
   `recorded_at` (ingestion time, stamped by the store) and optionally the
   `run_id` the feeder passed. `delete_since` removes by those, keeps a

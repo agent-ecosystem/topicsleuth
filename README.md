@@ -444,10 +444,11 @@ target's entry, with the other folded into it and noted. A
 split is checked in full before anything is written: every entry assigned
 exactly once, to a sub-topic that exists, with a known connection type.
 
-These commands may run while a feeder is writing. Neither side locks the
-store; instead, recording verifies its destination after writing and
-follows a merge or withdraws from a retired or deleted topic, and a merge
-or split carries along anything that arrived while it ran.
+These commands may run while a feeder is writing. There is no lock;
+each command marks a topic before deciding its fate, recording refuses a
+marked topic and re-checks after it writes, and a merge or split carries
+along anything that arrived before its mark. An entry withdrawn this way
+fails its document, which is retried next run.
 
 `clean` removes the observations, topics and snapshots written in a
 window, by when they were written rather than when their evidence

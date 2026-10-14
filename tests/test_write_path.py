@@ -638,3 +638,357 @@ def test_replay_summary_reports_secondary_links_and_drops(tmp_path):
     assert report["summary"]["links"] == {"total": 1, "per_link_decision": 1.0, "multi_link_decisions": 0,
                                            "secondary": 0, "secondary_strength_buckets": {}, "dropped_by_floor": 1}
     assert report["config"]["synthesize"]["secondary_link_floor"] == 0.6
+
+
+# ── round 3: the intended link set is durable, cleanup cannot orphan, derived state retries ──
+
+class _FailLinkOnce(MemoryStore):
+    """The first insert on ``topic`` fails; everything else behaves."""
+    def __init__(self, topic):
+        super().__init__()
+        self.topic, self.tripped = topic, False
+
+    def create_observation(self, obs_doc):
+        if obs_doc["topic_id"] == self.topic and not self.tripped:
+            self.tripped = True
+            raise RuntimeError("injected insert failure")
+        return super().create_observation(obs_doc)
+
+
+def _two_topic_store(cls=MemoryStore, **kw):
+    st = cls(**kw)
+    st.create_topic({"topic_id": "a", "title": "Topic A", "summary": "Tracks A.", "embedding": E_A})
+    st.create_topic({"topic_id": "b", "title": "Topic B", "summary": "Tracks B.", "embedding": E_B})
+    return st
+
+
+def test_a_direct_retry_finishes_the_intended_link_set_without_duplicates():
+    st, s = _two_topic_store(_FailLinkOnce, topic="b"), _settings()
+    items, evals, decisions = [_item("u1")], [_Eval("u1", E_A)], [_link("u1", "a", 0.8, "b")]
+    first = record(items, evals, decisions, st, settings=s)
+    assert [o["topic_id"] for o in first.observations_created] == ["a"] and first.failed_urls() == {"u1"}
+    assert st.get_observations_for_item("u1")[0]["decision_links"] == [
+        {"topic_id": "a", "connection_type": "supports", "strength": 0.8, "fit_questions": None},
+        {"topic_id": "b", "connection_type": "supports", "strength": 0.8, "fit_questions": None}], "the whole intent travels with the observation"
+    second = record(items, evals, decisions, st, settings=s)
+    assert second.failures == [] and [o["topic_id"] for o in second.observations_created] == ["b"]
+    assert [o["topic_id"] for o in second.already_recorded] == ["a"]
+    assert sorted(o["topic_id"] for o in st.get_observations_for_item("u1")) == ["a", "b"]
+    assert st.get_topic("b")["snapshots"][-1]["evidence_count"] == 1
+    third = record(items, evals, decisions, st, settings=s)
+    assert third.observations_created == [] and third.failures == [] and len(st.get_observations_for_item("u1")) == 2
+
+
+def test_a_full_pipeline_retry_finishes_the_intended_link_set_without_rejudging():
+    st = _two_topic_store(_FailLinkOnce, topic="b")
+    yes, no = True, False
+    two = {**LINK, "candidate_classifications": [{"topic_id": "a", "label": "same_question"}, {"topic_id": "b", "label": "same_question"}],
+           "links": [{"topic_id": "a", "connection_type": "supports", "fit_questions": FIT},
+                     {"topic_id": "b", "connection_type": "extends", "fit_questions": {"q1_scope_expansion": yes, "q2_representative_citation": yes, "q3_distinguishing_evidence": no}}]}
+    judge = ScriptedJudge([two])
+    _, first = _pipeline(st, [_item("u1")], judge)
+    assert first.failed_urls() == {"u1"} and [o["topic_id"] for o in st.get_observations_for_item("u1")] == ["a"]
+    decisions, second = _pipeline(st, [_item("u1")], judge)
+    assert len(judge.calls) == 1, "the judge was not called again"
+    assert [(l.topic_id, l.strength, l.connection_type) for l in decisions[0].links] == [("a", 0.8, "supports"), ("b", 0.8, "extends")], "reconstructed from the stored intent, not from what was written"
+    assert second.failures == [] and [o["topic_id"] for o in second.observations_created] == ["b"]
+    written = {o["topic_id"]: o for o in st.get_observations_for_item("u1")}
+    assert written["b"]["strength"] == 0.8 and written["b"]["connection_type"] == "extends" and written["b"]["fit_questions"]["q3_distinguishing_evidence"] is False
+    _, third = _pipeline(st, [_item("u1")], judge)
+    assert third.observations_created == [] and third.failures == [] and len(judge.calls) == 1
+
+
+def test_an_incomplete_link_set_is_not_acknowledged_until_it_is_complete():
+    st = _two_topic_store(_FailLinkOnce, topic="b")
+    st.tripped = False
+    class _AlwaysFailB(_FailLinkOnce):
+        def create_observation(self, obs_doc):
+            if obs_doc["topic_id"] == "b":
+                raise RuntimeError("b is down")
+            return MemoryStore.create_observation(self, obs_doc)
+    down = _two_topic_store(_AlwaysFailB, topic="b")
+    items, evals, decisions = [_item("u1")], [_Eval("u1", E_A)], [_link("u1", "a", 0.8, "b")]
+    for _ in range(3):
+        out = record(items, evals, decisions, down, settings=_settings())
+        assert out.failed_urls() == {"u1"} and out.failures[-1].stage == "create_observation"
+    assert [o["topic_id"] for o in down.get_observations_for_item("u1")] == ["a"], "a is written once, b never, and the item stays queued"
+
+
+def test_cleanup_cannot_orphan_an_observation_that_lands_while_it_decides():
+    """Cleanup marks the topic before counting. An insert that checks its
+    destination after the mark is refused; one that landed before the mark
+    is counted and the topic is kept. Either way nothing is orphaned."""
+    class _Racing(MemoryStore):
+        """During delete_since, a feeder records onto the topic right
+        after cleanup's count comes back empty."""
+        def __init__(self):
+            super().__init__()
+            self.in_cleanup = False
+            self.feeder_result = None
+
+        def count_observations_for_topic(self, topic_id):
+            n = super().count_observations_for_topic(topic_id)
+            if self.in_cleanup and topic_id == "arriving" and self.feeder_result is None:
+                self.feeder_result = record([_item("late")], [_Eval("late", E_A)], [_link("late", "arriving")], self, settings=_settings())
+            return n
+
+        def delete_since(self, cutoff, run_id=None):
+            self.in_cleanup = True
+            try:
+                return super().delete_since(cutoff, run_id)
+            finally:
+                self.in_cleanup = False
+    st = _Racing()
+    st.create_topic({"topic_id": "arriving", "title": "Arriving", "summary": "s", "embedding": E_A})
+    result = st.delete_since(datetime.now(timezone.utc) - timedelta(hours=1))
+    feeder = st.feeder_result
+    orphans = [o for o in st.list_observations() if st.get_topic(o["topic_id"]) is None]
+    assert orphans == [], "no observation points at a deleted topic"
+    assert result["topics_deleted"] == 1 and feeder.failed_urls() == {"late"}
+    assert "marked for deletion" in feeder.failures[0].error or "is deleting" in feeder.failures[0].error
+
+
+def test_reprocess_cannot_orphan_an_observation_that_lands_while_it_runs():
+    from topicsleuth.reprocess import execute_reprocess, plan_reprocess
+    class _Racing(MemoryStore):
+        def __init__(self):
+            super().__init__()
+            self.fired = False
+
+        def delete_observations_for_topic(self, topic_id):
+            if not self.fired:
+                self.fired = True
+                self.feeder_result = record([_item("late")], [_Eval("late", E_A)], [_link("late", topic_id)], self, settings=_settings())
+            return super().delete_observations_for_topic(topic_id)
+    st = _Racing()
+    st.create_topic({"topic_id": "weak", "title": "Weak", "summary": "s", "embedding": E_A,
+                     "date_identified": datetime.now(timezone.utc) - timedelta(days=90)})
+    st.create_observation({"topic_id": "weak", "item_url": "w0"})
+    out = execute_reprocess(st, plan_reprocess(st, max_obs=2))
+    assert out["topics_deleted"] == 1 and st.list_observations() == []
+    assert st.feeder_result.failed_urls() == {"late"}
+
+
+def test_a_failed_later_snapshot_rebuild_is_retried_until_the_series_is_right():
+    class _RebuildFailsOnce(MemoryStore):
+        tripped = False
+        def update_topic(self, topic_id, updates):
+            if "snapshots" in updates and not self.tripped:
+                self.tripped = True
+                raise RuntimeError("injected rebuild failure")
+            super().update_topic(topic_id, updates)
+    st, s = _RebuildFailsOnce(), _settings()
+    st.create_topic({"topic_id": "a", "title": "Topic A", "summary": "s", "embedding": E_A, "status": "active",
+                     "date_identified": MAY, "snapshots": [{"date": JULY, "evidence_count": 6, "velocity": 6 / 7, "recorded_at": JULY}]})
+    for i in range(6):
+        st.create_observation({"topic_id": "a", "item_url": f"a{i}", "date": JULY - timedelta(days=i)})
+    items, evals, decisions = [_item("u1", date_published=JUNE)], [_Eval("u1", E_A)], [_link("u1")]
+    first = record(items, evals, decisions, st, settings=s, date_from_item=True)
+    assert first.failures[0].stage == "snapshot_rebuild" and [x["evidence_count"] for x in st.get_topic("a")["snapshots"]] == [1, 6]
+    second = record(items, evals, decisions, st, settings=s, date_from_item=True)
+    assert second.failures == [] and second.observations_created == []
+    assert [(x["date"], x["evidence_count"]) for x in st.get_topic("a")["snapshots"]] == [(JUNE, 1), (JULY, 7)]
+
+
+def test_a_failed_embedding_refresh_is_retried_on_the_next_run_that_touches_the_topic():
+    class _EmbedderFailsOnce(HashEmbedder):
+        tripped = False
+        def embed_documents(self, texts):
+            if not self.tripped:
+                self.tripped = True
+                raise RuntimeError("embedding service down")
+            return super().embed_documents(texts)
+    st, s = MemoryStore(), _settings()
+    st.create_topic({"topic_id": "a", "title": "Topic A", "summary": "s", "embedding": E_B})
+    for i in range(4):
+        st.create_observation({"topic_id": "a", "item_url": f"a{i}"})
+        st.save_item_embedding(f"a{i}", E_A)
+    emb = _EmbedderFailsOnce(DIM)
+    items, evals, decisions = [_item("u1")], [_Eval("u1", E_A)], [_link("u1")]
+    first = record(items, evals, decisions, st, settings=s, embedder=emb)
+    assert first.failures[0].stage == "embedding_refresh" and st.get_topic("a")["embedding_refresh_pending"] is True
+    assert st.get_topic("a")["embedding"] == E_B, "the fifth observation crossed the threshold; the refresh did not land"
+    second = record(items, evals, decisions, st, settings=s, embedder=emb)
+    assert second.failures == [] and second.observations_created == [] and len(st.get_observations_for_item("u1")) == 1
+    topic = st.get_topic("a")
+    assert topic["embedding_refresh_pending"] is False and topic["embedding"] != E_B, "recomputed from the store, no observation added"
+
+
+# ── round 4: curation revises what a retry may finish; deletion marks survive a crash; refreshes wait for their inputs ──
+
+MERGED = {"title": "Merged", "summary": "AB.", "tags": [], "suggested_directions": [], "rationale": "r"}
+
+
+def test_a_retry_after_a_merge_follows_the_merge_and_never_writes_to_the_retired_topic():
+    from topicsleuth.merge import merge_topics
+    st = _two_topic_store()
+    judge = ScriptedJudge([LINK])
+    _, first = _pipeline(st, [_item("u1")], judge)
+    assert first.failures == [] and st.get_observations_for_item("u1")[0]["topic_id"] == "a"
+    merge_topics("a", "b", st, _settings(), ScriptedJudge([MERGED]), HashEmbedder(DIM, vectors={"Merged\n\nAB.": E_B}))
+    decisions, retry = _pipeline(st, [_item("u1")], judge)
+    assert len(judge.calls) == 1 and [l.topic_id for l in decisions[0].links] == ["b"]
+    assert retry.failures == [] and retry.observations_created == []
+    assert [o["topic_id"] for o in st.get_observations_for_item("u1")] == ["b"]
+
+
+def test_a_retry_after_a_move_keeps_the_move_and_does_not_recreate_the_old_link():
+    from topicsleuth.add_topic import move_observation
+    st = _two_topic_store()
+    st.create_observation({"topic_id": "a", "item_url": "keeps-a-live"})
+    judge = ScriptedJudge([LINK])
+    _pipeline(st, [_item("u1")], judge)
+    move_observation("u1", "b", st)
+    assert st.get_topic("a")["status"] != "retired"
+    decisions, retry = _pipeline(st, [_item("u1")], judge)
+    assert len(judge.calls) == 1 and [l.topic_id for l in decisions[0].links] == ["b"]
+    assert retry.failures == [] and retry.observations_created == []
+    assert [o["topic_id"] for o in st.get_observations_for_item("u1")] == ["b"], "a was taken off on purpose"
+
+
+def test_curating_one_link_of_a_multi_topic_item_does_not_revive_it_from_a_sibling_copy_of_the_plan():
+    from topicsleuth.add_topic import move_observation
+    st = _two_topic_store()
+    st.create_topic({"topic_id": "c", "title": "Topic C", "summary": "Tracks C.", "embedding": E_B})
+    for i in range(2):
+        st.create_observation({"topic_id": "a", "item_url": f"a{i}"})
+    items, evals = [_item("u1")], [_Eval("u1", E_A)]
+    record(items, evals, [_link("u1", "a", 0.8, "b")], st, settings=_settings())
+    plans = [o["decision_links"] for o in st.get_observations_for_item("u1")]
+    assert all([l["topic_id"] for l in p] == ["a", "b"] for p in plans), "both observations carry the full plan"
+    move_observation("u1", "c", st)  # moves every observation of u1 that is not already on c
+    assert sorted(o["topic_id"] for o in st.get_observations_for_item("u1")) == ["c"]
+    retry = record(items, evals, [_link("u1", "a", 0.8, "b")], st, settings=_settings())
+    assert retry.failures == [] and retry.observations_created == []
+    assert sorted(o["topic_id"] for o in st.get_observations_for_item("u1")) == ["c"], "neither a nor b is revived from the stale copies"
+    decisions = synthesize_items(items, evals, st, _settings(), ScriptedJudge([LINK]), HashEmbedder(DIM))
+    assert [l.topic_id for l in decisions[0].links] == ["c"]
+
+
+def test_a_retry_after_a_split_does_not_restore_the_retired_parent():
+    from topicsleuth.split import split_topic
+    st = _store()
+    judge = ScriptedJudge([LINK])
+    _pipeline(st, [_item("u1")], judge)
+    urls = [o["item_url"] for o in st.get_observations_for_topic("a")]
+    subs = {"sub_topics": [{"topic_id": "a-one", "title": "A one", "summary": "s1"}, {"topic_id": "a-two", "title": "A two", "summary": "s2"}]}
+    plan = [{"item_url": u, "new_topic_id": "a-one" if u == "u1" else "a-two"} for u in urls]
+    split_topic("a", st, _settings(), ScriptedJudge([subs, plan]), HashEmbedder(DIM, vectors={"A one\n\ns1": E_A, "A two\n\ns2": E_B}))
+    decisions, retry = _pipeline(st, [_item("u1")], judge)
+    assert len(judge.calls) == 1 and [l.topic_id for l in decisions[0].links] == ["a-one"]
+    assert retry.failures == [] and retry.observations_created == []
+    assert [o["topic_id"] for o in st.get_observations_for_item("u1")] == ["a-one"]
+
+
+def test_an_unfinished_link_to_a_topic_merged_meanwhile_is_finished_on_the_merge_target():
+    from topicsleuth.merge import merge_topics
+    st = _two_topic_store(_FailLinkOnce, topic="b")
+    st.create_topic({"topic_id": "c", "title": "Topic C", "summary": "Tracks C.", "embedding": E_B})
+    items, evals, decisions = [_item("u1")], [_Eval("u1", E_A)], [_link("u1", "a", 0.8, "b")]
+    first = record(items, evals, decisions, st, settings=_settings())
+    assert first.failed_urls() == {"u1"} and [o["topic_id"] for o in st.get_observations_for_item("u1")] == ["a"]
+    merge_topics("b", "c", st, _settings(), ScriptedJudge([MERGED]), HashEmbedder(DIM, vectors={"Merged\n\nAB.": E_B}))
+    retry = record(items, evals, decisions, st, settings=_settings())
+    assert retry.failures == [] and [o["topic_id"] for o in retry.observations_created] == ["c"], "the approved link, where its topic now lives"
+    assert sorted(o["topic_id"] for o in st.get_observations_for_item("u1")) == ["a", "c"]
+
+
+class _CountFailsOnce(MemoryStore):
+    tripped = False
+
+    def count_observations_for_topic(self, topic_id):
+        if topic_id == "kept" and not self.tripped:
+            self.tripped = True
+            raise RuntimeError("injected count failure")
+        return super().count_observations_for_topic(topic_id)
+
+
+def test_an_interrupted_cleanup_restores_the_original_status_on_retry():
+    st = _CountFailsOnce()
+    st.create_topic({"topic_id": "kept", "title": "Kept", "summary": "s", "embedding": E_A, "status": "active", "run_id": "cleanup-run"})
+    st.create_observation({"topic_id": "kept", "item_url": "x", "run_id": "other-run"})
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+    with pytest.raises(RuntimeError):
+        st.delete_since(cutoff, run_id="cleanup-run")
+    marked = st.get_topic("kept")
+    assert marked["status"] == "deleting" and marked["deleting"]["prior_status"] == "active" and marked["deleting"]["by"] == "clean"
+    result = st.delete_since(cutoff, run_id="cleanup-run")
+    assert result["topics_kept"] == 1 and result["topics_deleted"] == 0
+    topic = st.get_topic("kept")
+    assert topic["status"] == "active" and "deleting" not in topic, "the mark is never taken for the status to restore"
+    assert [t["topic_id"] for t in st.list_topics(include_retired=False)] == ["kept"], "visible again"
+    out = record([_item("u1")], [_Eval("u1", E_A)], [_link("u1", "kept")], st, settings=_settings())
+    assert out.failures == [] and len(out.observations_created) == 1, "and writable"
+
+
+def test_a_fresh_caller_recovers_deletions_a_crashed_run_left_marked():
+    from topicsleuth.reprocess import mark_deleting, recover_interrupted_deletions
+    st = MemoryStore()
+    st.create_topic({"topic_id": "holds", "title": "H", "summary": "s", "embedding": E_A, "status": "mature"})
+    st.create_observation({"topic_id": "holds", "item_url": "h0"})
+    st.create_topic({"topic_id": "empty", "title": "E", "summary": "s", "embedding": E_B})
+    mark_deleting(st, "holds", by="reprocess")
+    mark_deleting(st, "empty", by="clean")
+    mark_deleting(st, "holds", by="clean")
+    assert st.get_topic("holds")["deleting"]["by"] == "reprocess", "a second mark does not overwrite the first"
+    assert st.list_topics(include_retired=False) == [], "marked topics are hidden from the live listing"
+    out = recover_interrupted_deletions(st)  # knows nothing about the runs that set the marks
+    assert out == {"restored": ["holds"], "deleted": ["empty"]}
+    assert st.get_topic("holds")["status"] == "mature" and not st.get_topic("holds").get("deleting")
+    assert st.get_topic("empty") is None
+    assert recover_interrupted_deletions(st) == {"restored": [], "deleted": []}
+
+
+def test_the_round_three_cleanup_race_still_leaves_no_orphan_with_the_durable_mark():
+    test_cleanup_cannot_orphan_an_observation_that_lands_while_it_decides()
+
+
+class _SaveFailsOnce(MemoryStore):
+    tripped = False
+
+    def save_item_embedding(self, item_url, embedding):
+        if item_url == "u5" and not self.tripped:
+            self.tripped = True
+            raise RuntimeError("injected save failure")
+        super().save_item_embedding(item_url, embedding)
+
+
+def _four_plus_seed(cls):
+    st = cls()
+    st.create_topic({"topic_id": "a", "title": "Topic A", "summary": "s", "embedding": E_A})
+    for i in range(4):
+        st.create_observation({"topic_id": "a", "item_url": f"a{i}"})
+        st.save_item_embedding(f"a{i}", E_A)
+    return st
+
+
+def test_a_refresh_waits_for_the_item_embedding_this_run_failed_to_save():
+    from topicsleuth.embeddings import refresh_topic_embedding
+    st, s = _four_plus_seed(_SaveFailsOnce), _settings()
+    emb = HashEmbedder(DIM, vectors={"Topic A\n\ns": E_A})
+    items, evals, decisions = [_item("u5")], [_Eval("u5", E_B)], [_link("u5")]
+    first = record(items, evals, decisions, st, settings=s, embedder=emb)
+    assert [f.stage for f in first.failures] == ["save_embedding"]
+    assert st.get_topic("a")["embedding_refresh_pending"] is True and st.get_topic("a")["embedding"] == E_A, "no refresh from four of five inputs"
+    retry = record(items, evals, decisions, st, settings=s, embedder=emb)
+    assert retry.failures == [] and retry.observations_created == [] and len(st.get_observations_for_item("u5")) == 1
+    topic = st.get_topic("a")
+    assert topic["embedding_refresh_pending"] is False and st.get_item_embeddings(["u5"]) == {"u5": E_B}
+    after_retry = list(topic["embedding"])
+    assert after_retry != E_A and after_retry[1] > 0, "the fifth input pulled the embedding toward E_B"
+    refresh_topic_embedding("a", st, s, emb)
+    assert list(st.get_topic("a")["embedding"]) == after_retry, "equal to a recomputation from all five persisted inputs"
+
+
+def test_a_resumed_pending_refresh_uses_the_input_the_same_call_recovers():
+    st, s = _four_plus_seed(MemoryStore), _settings()
+    st.create_observation({"topic_id": "a", "item_url": "u5", "recorded_at": datetime.now(timezone.utc)})
+    st.append_snapshot("a", {"date": datetime.now(timezone.utc), "evidence_count": 5, "velocity": 5 / 7, "days_since_evidence": 0.0})
+    st.update_topic("a", {"embedding_refresh_pending": True})
+    assert st.get_item_embeddings(["u5"]) == {}, "u5's embedding never landed"
+    emb = HashEmbedder(DIM, vectors={"Topic A\n\ns": E_A})
+    out = record([_item("u5")], [_Eval("u5", E_B)], [_link("u5")], st, settings=s, embedder=emb)
+    assert out.failures == [] and out.observations_created == [] and len(out.already_recorded) == 1
+    topic = st.get_topic("a")
+    assert st.get_item_embeddings(["u5"]) == {"u5": E_B} and topic["embedding_refresh_pending"] is False
+    assert topic["embedding"][1] > 0, "the refresh ran after the embedding was saved and saw it"

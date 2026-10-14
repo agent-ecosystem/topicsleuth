@@ -11,7 +11,7 @@ from topicsleuth.embeddings import (
 from topicsleuth.interfaces import DuplicateObservation, DuplicateTopic, Embedder, ItemFailure, Store
 from topicsleuth.rubric import DEFAULT_CONNECTION_TYPE
 from topicsleuth.settings import Settings, load_settings
-from topicsleuth.synthesize import ItemEval, Link, SynthesisDecision
+from topicsleuth.synthesize import ItemEval, Link, SynthesisDecision, intended_links
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +243,9 @@ def record(
     # Topics whose status was re-checked from an existing snapshot while
     # resuming; the quiet-topic pass leaves them alone.
     resumed_status: set[str] = set()
+    # Topics found with a refresh still owed; done after the item
+    # embeddings are saved, so the refresh sees them.
+    pending_refresh: set[str] = set()
 
     def resume(stored: dict) -> None:
         result.already_recorded.append(stored)
@@ -271,6 +274,20 @@ def record(
                 except Exception as e:
                     logger.error("Failed to update status of %s", topic_id, exc_info=True)
                     fail(stored.get("item_url", ""), "status", e)
+            # The two derived stages that can fail after the snapshot: the
+            # rebuild of later snapshots when this was history, and the
+            # embedding refresh. Both are recomputed from the store, so
+            # repeating them is safe; a failure fails the item again.
+            latest = max((s["date"] for s in snapshots if s.get("date")), default=None)
+            if stored.get("date") and latest is not None and stored["date"] < latest:
+                try:
+                    _rebuild_later_snapshots(store, topic_id, stored["date"])
+                except Exception as e:
+                    logger.error("Failed to rebuild later snapshots of %s", topic_id, exc_info=True)
+                    fail(stored.get("item_url", ""), "snapshot_rebuild", e)
+            if topic.get("embedding_refresh_pending"):
+                # Not here: the item embeddings this batch saves come first.
+                pending_refresh.add(topic_id)
 
     def item_for(url: str) -> dict | None:
         return next((i for i in items if i["url"] == url), None)
@@ -325,11 +342,34 @@ def record(
         if decision.decision in ("skip", "failed"):
             continue
 
+        item = item_for(decision.item_url)
+        obs_date = date_for(item)
+
         if decision.item_url in already:
-            # The stored observations are the decision for this item; this
-            # batch's decision for it, whatever it says, is not applied.
-            for stored in already[decision.item_url]:
-                resume(stored)
+            # The stored observations carry the decision that was made for
+            # this item, including every link it intended. This batch's
+            # decision for it, whatever it says, is not applied; what the
+            # earlier run left unwritten of its own intent is written now.
+            stored = already[decision.item_url]
+            for o in stored:
+                resume(o)
+            present = {o.get("topic_id") for o in stored}
+            intended = intended_links(stored, store)
+            missing = [l for l in intended if l.topic_id not in present]
+            if missing:
+                logger.info("Item %s was recorded on %s of %s intended topics; finishing it",
+                            decision.item_url, len(present), len(intended))
+                earlier = SynthesisDecision(
+                    item_url=decision.item_url, item_title=stored[0].get("item_title", decision.item_title),
+                    decision="link_existing", topic_id=intended[0].topic_id, connection_type=intended[0].connection_type,
+                    strength=intended[0].strength, reasoning_trace=stored[0].get("reasoning_trace", ""), links=intended,
+                )
+                for link in missing:
+                    _record_link(
+                        store, result, earlier, link, item, stored[0].get("date") or obs_date, now,
+                        bool(stored[0].get("backfill")), run_id,
+                        failed_topics, prev_counts, affected_topics, batch_dates, resume, fail, settings,
+                    )
             continue
 
         if decision.decision == "propose_new" and decision.new_topic:
@@ -337,9 +377,9 @@ def record(
                           strength=decision.strength if decision.strength is not None else 0.7)]
         else:
             links = list(decision.links)
+        if decision.decision == "propose_new":
+            decision = SynthesisDecision(**{**decision.__dict__, "links": links})
 
-        item = item_for(decision.item_url)
-        obs_date = date_for(item)
         for link in links:
             _record_link(
                 store, result, decision, link, item, obs_date, now, backfill, run_id,
@@ -356,6 +396,10 @@ def record(
         except Exception as e:
             logger.error("Failed to save embedding for %s", eval_result.url, exc_info=True)
             fail(eval_result.url, "save_embedding", e)
+
+    # Items whose embedding this run could not save: a refresh that would
+    # read them is deferred until a retry has saved them.
+    embed_failed = {f.item_url for f in result.failures if f.stage == "save_embedding"}
 
     # 4. Compute and append snapshots to affected topics, detect transitions,
     #    refresh embeddings on evidence-count threshold crossings.
@@ -389,7 +433,12 @@ def record(
         )
         is_history = latest_snapshot is not None and as_of < latest_snapshot
         if is_history:
-            _rebuild_later_snapshots(store, topic_id, as_of)
+            try:
+                _rebuild_later_snapshots(store, topic_id, as_of)
+            except Exception as e:
+                logger.error("Failed to rebuild later snapshots of %s", topic_id, exc_info=True)
+                for url in urls_here:
+                    fail(url, "snapshot_rebuild", e)
 
         if date_from_item:
             # Vector search does not filter candidates by date, so an old
@@ -404,20 +453,9 @@ def record(
                 store.update_topic(topic_id, {"date_identified": earliest})
 
         new_count = store.count_observations_for_topic(topic_id)
-        if crossed_refresh_threshold(prev_counts.get(topic_id, 0), new_count):
-            if embedder is None:
-                logger.warning(
-                    "Topic %s crossed a refresh threshold but no embedder was "
-                    "given; skipping the embedding refresh", topic_id,
-                )
-            else:
-                try:
-                    refresh_topic_embedding(topic_id, store, settings, embedder)
-                except Exception:
-                    logger.warning(
-                        "Failed to refresh embedding for topic %s", topic_id,
-                        exc_info=True,
-                    )
+        if crossed_refresh_threshold(prev_counts.get(topic_id, 0), new_count) or topic.get("embedding_refresh_pending"):
+            _refresh_or_defer(store, topic_id, settings, embedder, urls_here, fail, embed_failed)
+        pending_refresh.discard(topic_id)
 
         transition = None if is_history else _detect_transition(topic, snapshot)
         if transition:
@@ -427,6 +465,12 @@ def record(
                 logger.error("Failed to update status of %s", topic_id, exc_info=True)
                 for url in urls_here:
                     fail(url, "status", e)
+
+    # 4b. Refreshes still owed on topics this batch only resumed.
+    for topic_id in pending_refresh:
+        if store.get_topic(topic_id):
+            urls_here = [o["item_url"] for o in result.already_recorded if o.get("topic_id") == topic_id]
+            _refresh_or_defer(store, topic_id, settings, embedder, urls_here, fail, embed_failed)
 
     # 5. Status check on the quiet topics. A topic that received nothing
     #    this run can only fade or go dormant, and nothing else would ever
@@ -458,6 +502,35 @@ def record(
                 _apply_transition(store, result, transition)
 
     return result
+
+
+def _refresh_or_defer(store: Store, topic_id: str, settings: Settings, embedder: Embedder | None,
+                      urls: list[str], fail, embed_failed: set[str] = frozenset()) -> None:
+    """Refresh a topic's embedding now, or leave ``embedding_refresh_pending``
+    on the topic so the next run that touches it tries again. The threshold
+    crossing that asked for the refresh happens once; the flag is what
+    survives a failure. A failed attempt fails the items that caused it.
+    A refresh is not attempted while an item embedding this run owes the
+    topic is unsaved: it would be computed from incomplete inputs and then
+    look finished."""
+    unsaved = sorted(set(urls) & set(embed_failed))
+    if unsaved:
+        logger.warning("Topic %s needs an embedding refresh but %s have no saved embedding yet; deferred", topic_id, unsaved)
+        store.update_topic(topic_id, {"embedding_refresh_pending": True})
+        return
+    if embedder is None:
+        logger.warning("Topic %s needs an embedding refresh but no embedder was given; deferred", topic_id)
+        store.update_topic(topic_id, {"embedding_refresh_pending": True})
+        return
+    try:
+        refreshed = refresh_topic_embedding(topic_id, store, settings, embedder)
+    except Exception as e:
+        logger.error("Failed to refresh embedding for topic %s; deferred", topic_id, exc_info=True)
+        store.update_topic(topic_id, {"embedding_refresh_pending": True})
+        for url in urls:
+            fail(url, "embedding_refresh", e)
+        return
+    store.update_topic(topic_id, {"embedding_refresh_pending": not refreshed})
 
 
 def _rebuild_later_snapshots(store: Store, topic_id: str, after: datetime) -> None:
@@ -508,8 +581,8 @@ def _record_link(store, result, decision, link, item, obs_date, now, backfill, r
     if destination is None:
         fail(decision.item_url, "create_observation", f"topic {topic_id!r} does not exist")
         return
-    if destination.get("status") == "retired":
-        fail(decision.item_url, "create_observation", f"topic {topic_id!r} is retired")
+    if destination.get("status") in ("retired", "deleting"):
+        fail(decision.item_url, "create_observation", f"topic {topic_id!r} is {destination['status']}")
         return
 
     evidence_count = store.count_observations_for_topic(topic_id)
@@ -538,6 +611,13 @@ def _record_link(store, result, decision, link, item, obs_date, now, backfill, r
         "strength": strength,
         "connection_type": link.connection_type or DEFAULT_CONNECTION_TYPE,
         "fit_questions": link.fit_questions,
+        # The whole decision, so a retry can finish it from any one of its
+        # observations: every topic the item was to be evidence for.
+        "decision_links": [
+            {"topic_id": l.topic_id, "connection_type": l.connection_type,
+             "strength": l.strength, "fit_questions": l.fit_questions}
+            for l in decision.links
+        ],
         "reasoning_trace": decision.reasoning_trace,
         "source_name": item.get("source_name", "") if item else "",
         "source_type": item.get("source_type", "") if item else "",
@@ -579,7 +659,7 @@ def _record_link(store, result, decision, link, item, obs_date, now, backfill, r
     # above and the insert; the observation then follows a merge, or is
     # withdrawn and the item fails, so nothing is stranded.
     landed = store.get_topic(topic_id)
-    if landed is None or landed.get("status") == "retired":
+    if landed is None or landed.get("status") in ("retired", "deleting"):
         target = (landed or {}).get("merged_into")
         target_topic = store.get_topic(target) if target else None
         if target_topic and target_topic.get("status") != "retired":
@@ -602,7 +682,7 @@ def _record_link(store, result, decision, link, item, obs_date, now, backfill, r
             prev_counts.setdefault(topic_id, store.count_observations_for_topic(topic_id) - 1)
         else:
             store.delete_observation(obs_id)
-            what = "deleted" if landed is None else "retired"
+            what = "deleted" if landed is None else ("retired" if landed.get("status") == "retired" else "marked for deletion")
             fail(decision.item_url, "create_observation", f"topic {topic_id!r} was {what} during the write")
             return
     if decision.decision == "propose_new":

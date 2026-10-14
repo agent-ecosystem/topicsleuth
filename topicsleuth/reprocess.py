@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from topicsleuth.interfaces import Store
 
@@ -61,6 +62,44 @@ def plan_reprocess(
     )
 
 
+def mark_deleting(store: Store, topic_id: str, by: str) -> None:
+    """Mark a topic as being deleted, keeping its prior status on the
+    document. A topic already marked keeps its original prior status."""
+    topic = store.get_topic(topic_id)
+    if not topic or topic.get("status") == "deleting":
+        return
+    store.update_topic(topic_id, {
+        "status": "deleting",
+        "deleting": {"prior_status": topic.get("status", "emerging"),
+                     "started_at": datetime.now(timezone.utc), "by": by},
+    })
+
+
+def recover_interrupted_deletions(store: Store) -> dict:
+    """Finish or undo every deletion a crashed or failed maintenance run
+    left half done. Any caller can run this; it needs nothing from the
+    run that set the marks. A marked topic that still holds observations
+    gets its prior status back; one that holds none is deleted. Returns
+    the ids restored and deleted."""
+    restored: list[str] = []
+    deleted: list[str] = []
+    for topic in store.list_topics(include_retired=True):
+        if topic.get("status") != "deleting":
+            continue
+        topic_id = topic["topic_id"]
+        if store.count_observations_for_topic(topic_id):
+            prior = (topic.get("deleting") or {}).get("prior_status", "emerging")
+            store.update_topic(topic_id, {"status": prior, "deleting": None})
+            restored.append(topic_id)
+            logger.warning("Restored topic %s to %s: an interrupted deletion had left it marked", topic_id, prior)
+        else:
+            store.delete_observations_for_topic(topic_id)
+            store.delete_topic(topic_id)
+            deleted.append(topic_id)
+            logger.warning("Finished an interrupted deletion of topic %s", topic_id)
+    return {"restored": restored, "deleted": deleted}
+
+
 def execute_reprocess(store: Store, plan: ReprocessPlan) -> dict:
     """Apply the plan: delete observations on weak topics and the weak
     topics themselves. Returns counts plus ``item_urls``, the items the
@@ -71,13 +110,15 @@ def execute_reprocess(store: Store, plan: ReprocessPlan) -> dict:
 
     for topic in plan.weak_topics:
         topic_id = topic["topic_id"]
-        # Topic first, then its observations: an insert that lands between
-        # the two finds the topic gone when it verifies its destination and
-        # removes itself, so nothing is stranded either way.
+        # Mark the topic as being deleted before touching anything: an
+        # insert that checks its destination from here on is refused, and
+        # one that landed earlier is deleted with the rest. The marker
+        # keeps the prior status so an interrupted run can be recovered.
+        mark_deleting(store, topic_id, by="reprocess")
+        deleted_obs += store.delete_observations_for_topic(topic_id)
         if store.delete_topic(topic_id):
             deleted_topics += 1
             logger.info("Deleted weak topic: %s", topic_id)
-        deleted_obs += store.delete_observations_for_topic(topic_id)
 
     return {
         "topics_deleted": deleted_topics,

@@ -100,8 +100,17 @@ def _preview_delete_since(store, cutoff: datetime, run_id: str | None = None) ->
             "topics_kept": kept, "snapshots_cleared": snapshots}
 
 
+def _recover_deletions(store) -> None:
+    from topicsleuth.reprocess import recover_interrupted_deletions
+    out = recover_interrupted_deletions(store)
+    if out["restored"] or out["deleted"]:
+        print(f"Recovered an interrupted deletion: restored {out['restored']}, deleted {out['deleted']}")
+
+
 def cmd_clean(args):
     settings, b = _backends()
+    if not args.dry_run:
+        _recover_deletions(b.store)
     cutoff = datetime.now(timezone.utc) - timedelta(hours=args.hours)
     scope = f"the last {args.hours}h" + (f" by run {args.run_id}" if args.run_id else "")
     if args.dry_run:
@@ -233,6 +242,8 @@ def cmd_reprocess_tail(args):
     from topicsleuth.reprocess import execute_reprocess, plan_reprocess
 
     settings, b = _backends()
+    if not args.dry_run:
+        _recover_deletions(b.store)
     plan = plan_reprocess(
         b.store, max_obs=args.max_obs, older_than_days=args.older_than_days
     )

@@ -42,7 +42,7 @@ class MemoryStore:
 
     def list_topics(self, include_retired: bool = True) -> list[dict]:
         return [copy.deepcopy(t) for t in self.topics.values()
-                if include_retired or t.get("status") != "retired"]
+                if include_retired or t.get("status") not in ("retired", "deleting")]
 
     def create_topic(self, topic_doc: dict) -> str:
         if topic_doc["topic_id"] in self.topics:
@@ -185,7 +185,18 @@ class MemoryStore:
             del self.observations[k]
         deleted = kept = 0
         for k in [k for k, t in self.topics.items() if in_window(t)]:
+            # Mark first, then count: an insert that lands after the mark
+            # sees it and withdraws, one that landed before is counted. The
+            # prior status is kept on the document, so an interrupted
+            # cleanup can be finished by anyone, and a retry never mistakes
+            # the mark itself for the status to restore.
+            t = self.topics[k]
+            if t.get("status") != "deleting":
+                t["deleting"] = {"prior_status": t.get("status", "emerging"), "started_at": datetime.now(timezone.utc), "by": "clean"}
+                t["status"] = "deleting"
             if self.count_observations_for_topic(k):
+                t["status"] = (t.get("deleting") or {}).get("prior_status", "emerging")
+                t.pop("deleting", None)
                 kept += 1
             else:
                 del self.topics[k]

@@ -69,7 +69,7 @@ class MongoStore:
         return self.topics.find_one({"topic_id": topic_id})
 
     def list_topics(self, include_retired: bool = True) -> list[dict]:
-        q = {} if include_retired else {"status": {"$ne": "retired"}}
+        q = {} if include_retired else {"status": {"$nin": ["retired", "deleting"]}}
         return list(self.topics.find(q))
 
     def create_topic(self, topic_doc: dict) -> str:
@@ -200,11 +200,26 @@ class MongoStore:
             window["run_id"] = run_id
         obs = self.observations.delete_many(window).deleted_count
         deleted = kept = 0
-        for t in self.topics.find(window, {"topic_id": 1}):
-            if self.count_observations_for_topic(t["topic_id"]):
+        for t in self.topics.find(window, {"topic_id": 1, "status": 1, "deleting": 1}):
+            # Mark first, then count: an insert that lands after the mark
+            # sees it and withdraws, one that landed before is counted. The
+            # prior status is kept on the document, so an interrupted
+            # cleanup can be finished by anyone, and a retry never mistakes
+            # the mark itself for the status to restore.
+            tid = t["topic_id"]
+            if t.get("status") != "deleting":
+                self.topics.update_one({"topic_id": tid}, {"$set": {
+                    "status": "deleting",
+                    "deleting": {"prior_status": t.get("status", "emerging"), "started_at": datetime.now(timezone.utc), "by": "clean"},
+                }})
+                prior = t.get("status", "emerging")
+            else:
+                prior = (t.get("deleting") or {}).get("prior_status", "emerging")
+            if self.count_observations_for_topic(tid):
+                self.topics.update_one({"topic_id": tid}, {"$set": {"status": prior}, "$unset": {"deleting": ""}})
                 kept += 1
             else:
-                self.topics.delete_one({"topic_id": t["topic_id"]})
+                self.topics.delete_one({"topic_id": tid})
                 deleted += 1
         snap_window = {"recorded_at": {"$gte": cutoff}}
         if run_id is not None:
