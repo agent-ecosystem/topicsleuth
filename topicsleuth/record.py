@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from topicsleuth.embeddings import (
     crossed_refresh_threshold,
@@ -37,21 +37,22 @@ def _topical_tags(tags: list[str], settings: Settings) -> list[str]:
     return [t for t in tags if t not in ignored]
 
 
-def _aware(dt: datetime) -> datetime:
-    """MongoDB hands back naive datetimes that are implicitly UTC."""
+def _as_utc(dt: datetime) -> datetime:
+    """A naive datetime on a feeder's item is taken as UTC."""
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def _item_date(item: dict | None) -> datetime | None:
     """When an item happened: its publish date, else when it was gathered.
-    Accepts datetimes or ISO strings, which is how feeders write them."""
+    Items are the feeder's documents, so this accepts datetimes or ISO
+    strings, naive or aware, which is how feeders write them."""
     for key in ("date_published", "date_gathered"):
         value = (item or {}).get(key)
         if isinstance(value, datetime):
-            return _aware(value)
+            return _as_utc(value)
         if isinstance(value, str) and value:
             try:
-                return _aware(datetime.fromisoformat(value))
+                return _as_utc(datetime.fromisoformat(value))
             except ValueError:
                 continue
     return None
@@ -85,21 +86,18 @@ def _compute_snapshot(store: Store, topic_id: str, now: datetime) -> dict:
         if obs.get("source_type"):
             source_types.add(obs["source_type"])
 
-    # Velocity: observations in last 7 days / 7
-    from datetime import timedelta
-    # MongoDB stores naive datetimes (implicitly UTC), so compare naive-to-naive
-    now_naive = now.replace(tzinfo=None) if now.tzinfo else now
-    week_ago = now_naive - timedelta(days=7)
+    # Velocity: observations in the last 7 days / 7. Dates from the store
+    # are timezone-aware (the Store contract), as is ``now``.
+    week_ago = now - timedelta(days=7)
     recent_count = sum(
-        1 for obs in observations
-        if obs.get("date") and obs["date"].replace(tzinfo=None) >= week_ago
+        1 for obs in observations if obs.get("date") and obs["date"] >= week_ago
     )
     velocity = recent_count / 7.0
 
     # Recency weight: inverse of days since latest observation
     if observations:
-        latest = max(obs.get("date", now_naive).replace(tzinfo=None) for obs in observations)
-        days_since = (now_naive - latest).total_seconds() / 86400.0
+        latest = max(obs.get("date") or now for obs in observations)
+        days_since = (now - latest).total_seconds() / 86400.0
         recency_weight = 1.0 / (1.0 + days_since)
     else:
         days_since = None
@@ -331,11 +329,11 @@ def record(
             # item can link to a topic founded later; the topic then dates
             # from its earliest evidence.
             earliest = min(
-                (_aware(o["date"]) for o in result.observations_created if o["topic_id"] == topic_id),
+                (o["date"] for o in result.observations_created if o["topic_id"] == topic_id),
                 default=None,
             )
             identified = topic.get("date_identified")
-            if earliest and identified and earliest < _aware(identified):
+            if earliest and identified and earliest < identified:
                 store.update_topic(topic_id, {"date_identified": earliest})
 
         if crossed_refresh_threshold(prev_count, snapshot["evidence_count"]):

@@ -8,7 +8,8 @@ import urllib.error
 
 import pytest
 
-from topicsleuth.interfaces import Completion, DecisionModel, Embedder, Judge
+from topicsleuth.interfaces import Completion, DecisionModel, Embedder, Judge, PairScore
+from topicsleuth.rubric import RELATIONSHIP_LABELS
 
 
 # ── Voyage ──
@@ -118,12 +119,14 @@ def test_jev_decision_model_posts_state_and_questions(monkeypatch):
     monkeypatch.setattr(jev.time, "sleep", lambda s: None)
     dm = jev.JevDecisionModel("secret", model="jev-test")
     assert isinstance(dm, DecisionModel)
-    out = jev.score_pair(dm, {"title": "An item", "summary": "s"}, {"title": "A topic", "summary": "t", "evidence_count": 3}, ["rep one"])
-    assert out["label"] == "same_question" and out["link_probability"] == 0.85 and out["input_tokens"] == 50 and out["model"] == "jev-9"
+    out = dm.score_pair({"title": "An item", "summary": "s"}, {"title": "A topic", "summary": "t", "evidence_count": 3}, ["rep one"])
+    assert out == PairScore(label="same_question", link_probability=0.85, confidence=0.9,
+                            probabilities={"same_question": 0.8}, input_tokens=50, model="jev-9")
     url, method, headers, body = seen[0]
     assert url == jev.API_URL and method == "POST"
     assert headers["Authorization"] == "Bearer secret"
     assert body["model"] == "jev-test" and set(body["questions"]) == {"relationship", "link"}
+    assert set(body["questions"]["relationship"]["criteria"]) == set(RELATIONSHIP_LABELS)
     assert body["state"]["candidate_topic"]["representative_observations"] == ["rep one"]
     assert body["state"]["item"]["title"] == "An item"
 

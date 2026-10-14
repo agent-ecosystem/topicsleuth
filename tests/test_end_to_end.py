@@ -6,7 +6,7 @@ and the curation flows on top of a populated store."""
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pytest
 
@@ -168,8 +168,9 @@ def test_decision_model_reviewer_demotes_on_confident_match():
     dm = ScriptedDecisionModel({"Topic A": 0.9, "Topic B": 0.2})
     d = synthesize_items([_item()], [_Eval("u1", E_B)], _store(), s, ScriptedJudge([PROPOSE]), HashEmbedder(DIM), decision_model=dm)[0]
     assert d.decision == "link_existing" and d.topic_id == "a" and d.connection_type == "extends" and d.strength == CONFIRM_LINK_STRENGTH
-    assert d.diagnostics["confirmation"] == "overridden_to_link" and len(d.diagnostics["jev_scores"]) == 2
-    assert all("representative_observations" in c["candidate_topic"] for c in dm.calls)
+    assert d.diagnostics["confirmation"] == "overridden_to_link" and len(d.diagnostics["decision_scores"]) == 2
+    assert {c["topic"]["title"] for c in dm.calls} == {"Topic A", "Topic B"}
+    assert all(c["item"]["url"] == "u1" and isinstance(c["representative_titles"], list) for c in dm.calls)
 
 
 def test_decision_model_reviewer_keeps_proposal_below_threshold_or_when_absent():

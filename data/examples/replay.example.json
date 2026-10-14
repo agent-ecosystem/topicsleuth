@@ -106,7 +106,7 @@
    "reasoning_trace": "Same question: the item reports the yields the topic tracks.",
    "diagnostics": {
     "confirmation": null,
-    "jev_scores": null,
+    "decision_scores": null,
     "confirm_input_tokens": null,
     "confirm_output_tokens": null,
     "vector_candidates": 5,
@@ -163,7 +163,7 @@
    },
    "diagnostics": {
     "confirmation": "confirmed_new",
-    "jev_scores": null,
+    "decision_scores": null,
     "confirm_input_tokens": 4100,
     "confirm_output_tokens": 300,
     "vector_candidates": 5,

@@ -150,3 +150,22 @@ def test_delete_since(store):
     assert store.get_topic("new") is None and store.get_topic("old") is not None
     assert [s["evidence_count"] for s in store.get_topic("old")["snapshots"]] == [1]
     assert [o["item_url"] for o in store.list_observations()] == ["u1"]
+
+
+def test_datetimes_come_back_timezone_aware(store):
+    """The contract: a store returns aware UTC datetimes and reads a naive
+    one as UTC, so the library never has to guess."""
+    naive = datetime(2026, 3, 1, 12, 0)
+    store.create_topic({"topic_id": "a", "title": "A", "date_identified": naive})
+    store.create_observation({"topic_id": "a", "item_url": "u", "date": naive})
+    store.create_observation({"topic_id": "a", "item_url": "v"})
+    store.append_snapshot("a", {"date": naive, "evidence_count": 2})
+    store.update_topic("a", {"retired_at": naive})
+    t = store.get_topic("a")
+    assert t["date_identified"] == naive.replace(tzinfo=timezone.utc)
+    assert t["retired_at"] == naive.replace(tzinfo=timezone.utc)
+    assert t["last_updated"].tzinfo is not None
+    assert t["snapshots"][0]["date"] == naive.replace(tzinfo=timezone.utc)
+    for o in store.get_observations_for_topic("a"):
+        assert o["date"].tzinfo is not None
+    assert store.list_topics()[0]["date_identified"].tzinfo is not None

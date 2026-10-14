@@ -1,7 +1,7 @@
 """Tuning harness for prompt and config experimentation.
 
 Replays the decision against already-recorded items without writing to
-MongoDB. Use this to compare decision distributions, strength calibration, and
+the store. Use this to compare decision distributions, strength calibration, and
 new-topic proposal rates across prompt or config changes.
 
 Reads stored item embeddings so the feeder's evaluate stage doesn't have to
@@ -61,9 +61,9 @@ def _replay_items(store: Store, prior_run: Path) -> list[dict]:
 
 
 def _sample_items(store: Store, n: int, seed: int, query: dict) -> list[dict]:
-    """A seeded sample of items matching ``query``. Stores that can sample
-    server-side (MongoStore) expose ``sample_items``; anything else must be
-    replayed from a prior report."""
+    """A seeded sample of items matching ``query``. A store that can sample
+    server-side exposes ``sample_items``; with any other store, replay from
+    a prior report."""
     sampler = getattr(store, "sample_items", None)
     if sampler is None:
         raise ValueError("this store cannot sample items; use replay_from")
@@ -319,7 +319,7 @@ def replay_synthesis(
     if output_path is None:
         DEFAULT_OUTPUT_DIR.mkdir(exist_ok=True)
         stem = label or datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        tail = f"replay" if replay_from else f"n{n}-seed{seed}"
+        tail = "replay" if replay_from else f"n{n}-seed{seed}"
         output_path = DEFAULT_OUTPUT_DIR / f"synthesize-{stem}-{tail}.json"
     else:
         output_path = Path(output_path)

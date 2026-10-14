@@ -34,7 +34,7 @@ object with the right methods qualifies, no base class.
 | `Store` | topics and observations, nearest-topic search, item embeddings | `backends.mongo.MongoStore` (Atlas Vector Search); `backends.memory.MemoryStore` for tests |
 | `Embedder` | text to vectors, with `dimensions` | `backends.voyage.VoyageEmbedder` |
 | `Judge` | a language model asked for text: the decision, its reviewer, merge and split rewrites | `backends.anthropic.AnthropicJudge` |
-| `DecisionModel` | structured questions in, probabilities out; optional, for the `decision` reviewer | `backends.jev.JevDecisionModel` |
+| `DecisionModel` | scores one item against one candidate topic, a relationship label and a link probability, no text; optional, for the `decision` reviewer | `backends.jev.JevDecisionModel` |
 
 Each default imports its SDK lazily and ships behind an extra
 (`topicsleuth[mongo]`, `[voyage]`, `[anthropic]`, or `[all]`), so the core

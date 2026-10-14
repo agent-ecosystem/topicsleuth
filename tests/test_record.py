@@ -54,7 +54,7 @@ def _FakeStorage():
     """The reference in-memory Store, with one topic founded in August."""
     from topicsleuth.backends.memory import MemoryStore
     st = MemoryStore()
-    st.create_topic({"topic_id": "t1", "title": "T1", "date_identified": datetime(2026, 8, 1)})
+    st.create_topic({"topic_id": "t1", "title": "T1", "date_identified": datetime(2026, 8, 1, tzinfo=timezone.utc)})
     return st
 
 
@@ -102,7 +102,7 @@ class TestRecordItemDates:
         st = _FakeStorage()
         record(*_dated_link(), st, settings=Settings())
         assert _obs(st)[0]["date"] > MARCH
-        assert st.topics["t1"]["date_identified"] == datetime(2026, 8, 1)
+        assert st.topics["t1"]["date_identified"] == datetime(2026, 8, 1, tzinfo=timezone.utc)
 
     def test_item_dates_flow_to_observation_snapshot_and_topic(self):
         from topicsleuth.record import record

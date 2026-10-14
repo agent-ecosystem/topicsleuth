@@ -53,15 +53,35 @@ class Judge(Protocol):
     def complete(self, system: str, user: str, max_tokens: int = 2048) -> Completion: ...
 
 
+@dataclass
+class PairScore:
+    """A decision model's reading of one item against one candidate topic.
+    ``label`` is one of ``topicsleuth.rubric.RELATIONSHIP_LABELS`` and
+    ``link_probability`` is p(the item belongs as evidence under the topic),
+    which the proposal reviewer compares with ``confirm_link_threshold``.
+    The rest is kept for reports."""
+
+    label: str | None
+    link_probability: float | None
+    confidence: float | None = None
+    probabilities: dict[str, float] | None = None
+    input_tokens: int | None = None
+    model: str | None = None
+
+
 @runtime_checkable
 class DecisionModel(Protocol):
-    """A decision-only model: structured state and questions in, a
-    probability per option and a confidence out, no text. Optional; used
-    by the proposal reviewer when settings select the ``decision`` backend."""
+    """A decision-only model: scores one item against one candidate topic
+    and returns probabilities, no text. It applies the rubric in
+    ``topicsleuth.rubric`` in whatever form its API takes. Optional; used
+    by the proposal reviewer when settings select the ``decision`` backend.
+    ``model`` is informational, for replay reports."""
 
     model: str
 
-    def decide(self, state: dict, questions: dict) -> dict: ...
+    def score_pair(
+        self, item: dict, topic: dict, representative_titles: list[str]
+    ) -> PairScore: ...
 
 
 @runtime_checkable
@@ -74,6 +94,10 @@ class Store(Protocol):
     Documents are plain dicts. ``topic_id`` identifies a topic;
     observations carry ``topic_id`` and ``item_url``. A store returns its
     own identifier for a created observation.
+
+    Every datetime a store hands back is timezone-aware, in UTC. A store
+    given a naive datetime treats it as UTC. The library does its date
+    arithmetic on that contract and never normalizes what a store returns.
     """
 
     # ── topics ──

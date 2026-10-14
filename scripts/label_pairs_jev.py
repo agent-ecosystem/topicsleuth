@@ -8,8 +8,9 @@ as the `state`, with two questions evaluated in parallel:
   relationship  choice  same_question | subset_question | adjacent_question | surface_overlap
   link          noul    "This item belongs as evidence under this topic."
 
-The rubric lives in the option descriptions (Jev reads the field names and
-values of each criterion), not in a system prompt, since there is none.
+The rubric is the library's own (``topicsleuth.rubric``), rendered into
+Jev's option descriptions by ``topicsleuth.backends.jev``; it lives in the
+option descriptions, not in a system prompt, since there is none.
 Output has the same shape as the other rater files, with Jev's probabilities
 and confidence kept per pair. The API key comes from TYPESAFE_API_KEY.
 
@@ -33,52 +34,13 @@ from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from topicsleuth.backends.jev import API_URL as API, PAIR_QUESTIONS as QUESTIONS  # noqa: E402
+from topicsleuth.rubric import RELATIONSHIP_LABELS  # noqa: E402
+
 PAIRS = ROOT / "data" / "labels" / "pairs.json"
-API = "https://api.typesafe.ai/v1/systemone"
-LABELS = ["same_question", "subset_question", "adjacent_question", "surface_overlap"]
-
-# Option descriptions carry the rubric. Structured objects per the vendor's
-# guidance for confusingly similar options: short field names, plain values.
-CRITERIA = {
-    "same_question": {
-        "what": "The topic's research question is the question this item investigates. The item's primary contribution is an answer or partial answer to it.",
-        "not_for": "An item that only touches the topic's subject, or that asks a narrower sub-question (that is subset_question).",
-    },
-    "subset_question": {
-        "what": "The item investigates a specific instance of the topic's question; the topic's question subsumes it. A different method, artifact type, or subdomain inside the same question is still a subset.",
-        "example": "Topic asks how agents fail in ways static analysis misses; item proposes a detector for one failure class.",
-        "not_for": "An item whose question the topic's summary, read fairly, does not cover (that is adjacent_question).",
-    },
-    "adjacent_question": {
-        "what": "A different research question in the same domain. The topic's summary does not cover what the item is about, even though they share keywords.",
-        "tie_break": "If broadening the topic summary by one clause would cover the item, prefer subset_question.",
-        "not_for": "Pairs that share only tags, model names or subfield with no shared direction (that is surface_overlap).",
-    },
-    "surface_overlap": {
-        "what": "Shared tags, model names or subfield, but the item's research question lies elsewhere. A literature review of the topic would not cite this item.",
-        "not_for": "Pairs in the same research area with a genuinely neighbouring question (that is adjacent_question).",
-    },
-}
-
-QUESTIONS = {
-    "relationship": {
-        "type": "choice",
-        "instructions": (
-            "Name the research question the item investigates and the research question the "
-            "candidate topic investigates, then pick the structural relationship between them. "
-            "The label is descriptive, not a quality judgment. Weigh the topic's representative "
-            "observations alongside its one-sentence summary."
-        ),
-        "criteria": CRITERIA,
-    },
-    "link": {
-        "type": "noul",
-        "instructions": (
-            "This item belongs as evidence under this topic: the topic's research question is the "
-            "same as, or subsumes, the item's research question."
-        ),
-    },
-}
+LABELS = list(RELATIONSHIP_LABELS)
 
 
 def state_for(p: dict) -> dict:

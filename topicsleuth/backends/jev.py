@@ -1,9 +1,9 @@
-"""TypeSafe Jev as the decision model, and the item-topic pair questions the
-proposal reviewer asks it.
+"""TypeSafe Jev as the decision model.
 
 Jev scores a fixed option list in one forward pass and returns a probability
 distribution plus a confidence, with no text. There is no system prompt; the
-rubric is carried in the option descriptions. No SDK: plain HTTPS.
+rubric from ``topicsleuth.rubric`` is carried in the option descriptions,
+which Jev reads field by field. No SDK: plain HTTPS.
 """
 from __future__ import annotations
 
@@ -13,49 +13,30 @@ import time
 import urllib.error
 import urllib.request
 
+from topicsleuth.interfaces import PairScore
+from topicsleuth.rubric import (
+    LINK_CRITERION,
+    RELATIONSHIP_CRITERIA,
+    RELATIONSHIP_INSTRUCTIONS,
+    pair_view,
+)
+
 logger = logging.getLogger(__name__)
 
 API_URL = "https://api.typesafe.ai/v1/systemone"
 DEFAULT_MODEL = "jev-latest"
 
-RELATIONSHIP_CRITERIA = {
-    "same_question": {
-        "what": "The topic's question is the question this item bears on. The item's primary contribution is an answer or partial answer to it.",
-        "not_for": "An item that only touches the topic's subject, or that asks a narrower sub-question (that is subset_question).",
-    },
-    "subset_question": {
-        "what": "The item investigates a specific instance of the topic's question; the topic's question subsumes it. A different method, artifact type, or subdomain inside the same question is still a subset.",
-        "example": "Topic asks how agents fail in ways static analysis misses; item proposes a detector for one failure class.",
-        "not_for": "An item whose question the topic's summary, read fairly, does not cover (that is adjacent_question).",
-    },
-    "adjacent_question": {
-        "what": "A different question in the same domain. The topic's summary does not cover what the item is about, even though they share keywords.",
-        "tie_break": "If broadening the topic summary by one clause would cover the item, prefer subset_question.",
-        "not_for": "Pairs that share only tags, model names or subfield with no shared direction (that is surface_overlap).",
-    },
-    "surface_overlap": {
-        "what": "Shared tags, model names or subfield, but the item's question lies elsewhere. A literature review of the topic would not cite this item.",
-        "not_for": "Pairs in the same area with a genuinely neighbouring question (that is adjacent_question).",
-    },
-}
-
+# The library's rubric in Jev's question format: a choice over the
+# relationship labels and a yes/no ("noul") on whether the item belongs.
 PAIR_QUESTIONS = {
     "relationship": {
         "type": "choice",
-        "instructions": (
-            "Name the question the item bears on and the question the "
-            "candidate topic investigates, then pick the structural relationship between them. "
-            "The label is descriptive, not a quality judgment. Weigh the topic's representative "
-            "observations alongside its one-sentence summary."
-        ),
+        "instructions": RELATIONSHIP_INSTRUCTIONS,
         "criteria": RELATIONSHIP_CRITERIA,
     },
     "link": {
         "type": "noul",
-        "instructions": (
-            "This item belongs as evidence under this topic: the topic's question is the "
-            "same as, or subsumes, the item's question."
-        ),
+        "instructions": LINK_CRITERION,
     },
 }
 
@@ -75,8 +56,22 @@ class JevDecisionModel:
         self.retries = retries
         self.timeout = timeout
 
+    def score_pair(self, item: dict, topic: dict, representative_titles: list[str]) -> PairScore:
+        resp = self.decide(pair_view(item, topic, representative_titles), PAIR_QUESTIONS)
+        answers = resp.get("answers") or {}
+        rel = answers.get("relationship") or {}
+        link = answers.get("link") or {}
+        return PairScore(
+            label=rel.get("choice"),
+            link_probability=link.get("noul"),
+            confidence=rel.get("confidence"),
+            probabilities=rel.get("probabilities"),
+            input_tokens=(resp.get("usage") or {}).get("input_tokens"),
+            model=resp.get("model", self.model),
+        )
+
     def decide(self, state: dict, questions: dict) -> dict:
-        """One call. Returns the parsed response ({model, answers, usage})."""
+        """One raw call: Jev's own request and reply shapes."""
         body = json.dumps({"model": self.model, "state": state, "questions": questions}).encode()
         req = urllib.request.Request(
             API_URL, data=body, method="POST",
@@ -98,35 +93,3 @@ class JevDecisionModel:
                     continue
                 raise JevError(str(e)) from None
         raise JevError("unreachable")
-
-
-def pair_state(item: dict, topic: dict, representative_titles: list[str]) -> dict:
-    return {
-        "item": {
-            "title": item.get("title", ""),
-            "summary": item.get("summary", ""),
-            "abstract_excerpt": (item.get("content_raw") or "")[:1800],
-        },
-        "candidate_topic": {
-            "title": topic.get("title", ""),
-            "summary": topic.get("summary", ""),
-            "observations_so_far": topic.get("evidence_count"),
-            "representative_observations": representative_titles,
-        },
-    }
-
-
-def score_pair(decision_model, item: dict, topic: dict, representative_titles: list[str]) -> dict:
-    """Score one item-topic pair with any DecisionModel. Returns {label,
-    probabilities, confidence, link_probability, input_tokens, model}."""
-    resp = decision_model.decide(pair_state(item, topic, representative_titles), PAIR_QUESTIONS)
-    rel = resp["answers"]["relationship"]
-    link = resp["answers"].get("link") or {}
-    return {
-        "label": rel.get("choice"),
-        "probabilities": rel.get("probabilities"),
-        "confidence": rel.get("confidence"),
-        "link_probability": link.get("noul"),
-        "input_tokens": (resp.get("usage") or {}).get("input_tokens"),
-        "model": resp.get("model", getattr(decision_model, "model", None)),
-    }

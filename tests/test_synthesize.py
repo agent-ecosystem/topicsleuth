@@ -547,37 +547,37 @@ class TestConfirmationCandidates:
         assert [c["topic_id"] for c in _confirmation_candidates({}, vec, vec, n=5)] == ["v1"]
 
 
-from topicsleuth.synthesize import _apply_jev_confirmation  # noqa: E402
+from topicsleuth.synthesize import _apply_decision_confirmation  # noqa: E402
 
 
-class TestApplyJevConfirmation:
+class TestApplyDecisionConfirmation:
     def test_best_candidate_above_threshold_links(self):
         scores = [
             {"topic_id": "a", "link_probability": 0.42, "label": "adjacent_question", "confidence": 0.5},
             {"topic_id": "b", "link_probability": 0.81, "label": "subset_question", "confidence": 0.7},
         ]
-        out = _apply_jev_confirmation(_proposal(), scores, 0.7)
+        out = _apply_decision_confirmation(_proposal(), scores, 0.7)
         assert out["decision"] == "link_existing" and out["topic_id"] == "b"
         assert out["connection_type"] == "extends"
         assert out["strength"] == CONFIRM_LINK_STRENGTH
         assert out["new_topic"] is None
         assert out["confirmation"] == "overridden_to_link"
-        assert "CONFIRMATION PASS (jev)" in out["reasoning_trace"]
+        assert "CONFIRMATION PASS (decision model)" in out["reasoning_trace"]
 
     def test_below_threshold_keeps_proposal(self):
         scores = [{"topic_id": "a", "link_probability": 0.69, "label": "subset_question", "confidence": 0.6}]
-        out = _apply_jev_confirmation(_proposal(), scores, 0.7)
+        out = _apply_decision_confirmation(_proposal(), scores, 0.7)
         assert out["decision"] == "propose_new"
         assert out["confirmation"] == "confirmed_new"
 
     def test_no_scores_keeps_proposal(self):
-        out = _apply_jev_confirmation(_proposal(), [], 0.7)
+        out = _apply_decision_confirmation(_proposal(), [], 0.7)
         assert out["decision"] == "propose_new"
         assert out["confirmation"] == "confirmed_new"
 
     def test_malformed_scores_are_ignored(self):
         scores = [{"topic_id": "a", "link_probability": None}, {"topic_id": None, "link_probability": 0.9}]
-        out = _apply_jev_confirmation(_proposal(), scores, 0.7)
+        out = _apply_decision_confirmation(_proposal(), scores, 0.7)
         assert out["decision"] == "propose_new"
 
 

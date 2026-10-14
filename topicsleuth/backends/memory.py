@@ -13,8 +13,16 @@ from typing import Any
 import numpy as np
 
 
-def _naive(dt: datetime) -> datetime:
-    return dt.replace(tzinfo=None) if dt.tzinfo else dt
+def _aware(value):
+    """The Store contract: a naive datetime written to the store is UTC,
+    and everything read back is timezone-aware."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, dict):
+        return {k: _aware(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_aware(v) for v in value]
+    return value
 
 
 class MemoryStore:
@@ -38,7 +46,7 @@ class MemoryStore:
         if topic_doc["topic_id"] in self.topics:
             raise ValueError(f"duplicate topic_id: {topic_doc['topic_id']}")
         now = datetime.now(timezone.utc)
-        doc = dict(topic_doc)
+        doc = _aware(dict(topic_doc))
         doc.setdefault("date_identified", now)
         doc.setdefault("last_updated", now)
         doc.setdefault("status", "emerging")
@@ -50,7 +58,7 @@ class MemoryStore:
 
     def update_topic(self, topic_id: str, updates: dict) -> None:
         t = self.topics[topic_id]
-        t.update(updates)
+        t.update(_aware(updates))
         t["last_updated"] = datetime.now(timezone.utc)
 
     def delete_topic(self, topic_id: str) -> bool:
@@ -58,7 +66,7 @@ class MemoryStore:
 
     def append_snapshot(self, topic_id: str, snapshot: dict) -> None:
         t = self.topics[topic_id]
-        t.setdefault("snapshots", []).append(dict(snapshot))
+        t.setdefault("snapshots", []).append(_aware(dict(snapshot)))
         t["last_updated"] = datetime.now(timezone.utc)
 
     def nearest_topics(self, embedding: list[float], limit: int) -> list[dict]:
@@ -90,12 +98,12 @@ class MemoryStore:
     def find_weak_topics(self, max_obs: int, older_than_days: int | None) -> list[dict]:
         cutoff = None
         if older_than_days is not None:
-            cutoff = _naive(datetime.now(timezone.utc) - timedelta(days=older_than_days))
+            cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
         weak = []
         for t in self.topics.values():
             if t.get("status") not in ("emerging", "active"):
                 continue
-            if cutoff and t.get("date_identified") and _naive(t["date_identified"]) >= cutoff:
+            if cutoff and t.get("date_identified") and t["date_identified"] >= cutoff:
                 continue
             if self.count_observations_for_topic(t["topic_id"]) <= max_obs:
                 weak.append(copy.deepcopy(t))
@@ -104,7 +112,7 @@ class MemoryStore:
     # ── observations ──
     def create_observation(self, obs_doc: dict) -> Any:
         oid = next(self._ids)
-        doc = dict(obs_doc)
+        doc = _aware(dict(obs_doc))
         doc.setdefault("date", datetime.now(timezone.utc))
         doc["_id"] = oid
         self.observations[oid] = doc
@@ -123,7 +131,7 @@ class MemoryStore:
         return [copy.deepcopy(o) for o in self.observations.values()]
 
     def update_observation(self, obs_id: Any, updates: dict) -> None:
-        self.observations[obs_id].update(updates)
+        self.observations[obs_id].update(_aware(updates))
 
     def delete_observations_for_topic(self, topic_id: str) -> int:
         doomed = [k for k, o in self.observations.items() if o.get("topic_id") == topic_id]
@@ -152,16 +160,16 @@ class MemoryStore:
 
     # ── maintenance ──
     def delete_since(self, cutoff: datetime) -> dict:
-        c = _naive(cutoff)
-        obs = [k for k, o in self.observations.items() if o.get("date") and _naive(o["date"]) >= c]
+        c = _aware(cutoff)
+        obs = [k for k, o in self.observations.items() if o.get("date") and o["date"] >= c]
         for k in obs:
             del self.observations[k]
-        topics = [k for k, t in self.topics.items() if t.get("date_identified") and _naive(t["date_identified"]) >= c]
+        topics = [k for k, t in self.topics.items() if t.get("date_identified") and t["date_identified"] >= c]
         for k in topics:
             del self.topics[k]
         cleared = 0
         for t in self.topics.values():
             before = len(t.get("snapshots", []))
-            t["snapshots"] = [s for s in t.get("snapshots", []) if not (s.get("date") and _naive(s["date"]) >= c)]
+            t["snapshots"] = [s for s in t.get("snapshots", []) if not (s.get("date") and s["date"] >= c)]
             cleared += before - len(t["snapshots"])
         return {"observations_deleted": len(obs), "topics_deleted": len(topics), "snapshots_cleared": cleared}

@@ -14,7 +14,7 @@ import hashlib
 import json
 from collections.abc import Callable, Iterable
 
-from topicsleuth.interfaces import Completion
+from topicsleuth.interfaces import Completion, PairScore
 
 
 class HashEmbedder:
@@ -77,29 +77,24 @@ class ScriptedJudge:
 
 
 class ScriptedDecisionModel:
-    """Answers the item-topic pair questions from ``link_probabilities``, a
-    map of candidate topic title to p(belongs). Unknown titles score 0.1."""
+    """Scores item-topic pairs from ``link_probabilities``, a map of
+    candidate topic title to p(belongs). Unknown titles score 0.1. Each
+    call is recorded as ``{item, topic, representative_titles}``."""
 
     def __init__(self, link_probabilities: dict[str, float] | None = None, model: str = "scripted-decision"):
         self.model = model
         self.link_probabilities = dict(link_probabilities or {})
         self.calls: list[dict] = []
 
-    def decide(self, state: dict, questions: dict) -> dict:
-        self.calls.append(state)
-        title = (state.get("candidate_topic") or {}).get("title", "")
-        p = self.link_probabilities.get(title, 0.1)
+    def score_pair(self, item: dict, topic: dict, representative_titles: list[str]) -> PairScore:
+        self.calls.append({"item": item, "topic": topic, "representative_titles": list(representative_titles)})
+        p = self.link_probabilities.get(topic.get("title", ""), 0.1)
         label = "same_question" if p >= 0.7 else "adjacent_question"
-        answers = {}
-        if "relationship" in questions:
-            answers["relationship"] = {
-                "choice": label,
-                "probabilities": {label: p, "surface_overlap": 1 - p},
-                "confidence": 0.9,
-            }
-        if "link" in questions:
-            answers["link"] = {"noul": p}
-        return {"model": self.model, "answers": answers, "usage": {"input_tokens": 100}}
+        return PairScore(
+            label=label, link_probability=p, confidence=0.9,
+            probabilities={label: p, "surface_overlap": 1 - p},
+            input_tokens=100, model=self.model,
+        )
 
 
 # Process-wide instances the CLI picks up when TOPICSLEUTH_STORE=memory,

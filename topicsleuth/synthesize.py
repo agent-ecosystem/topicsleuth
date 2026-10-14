@@ -4,7 +4,7 @@ import json
 import logging
 from typing import Protocol
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass
 
 from topicsleuth.interfaces import DecisionModel, Embedder, Judge, Store
 from topicsleuth.settings import Settings
@@ -877,21 +877,22 @@ def _apply_confirmation(parsed: dict, confirm: dict, candidate_ids: set[str]) ->
     return parsed
 
 
-def _apply_jev_confirmation(parsed: dict, scores: list[dict], threshold: float) -> dict:
-    """Fold per-candidate Jev scores into the first-pass decision.
+def _apply_decision_confirmation(parsed: dict, scores: list[dict], threshold: float) -> dict:
+    """Fold per-candidate decision-model scores into the first-pass decision.
 
-    scores: [{topic_id, link_probability, label, confidence}] for the shown
-    candidates. The candidate with the highest link probability wins; at or
-    above threshold the proposal becomes an `extends` link to it at
-    CONFIRM_LINK_STRENGTH, otherwise the proposal stands. No skip path: Jev
-    is not asked whether the proposed topic is right-sized.
+    scores: [{topic_id, link_probability, label, confidence, ...}] for the
+    shown candidates (a PairScore per candidate, as a dict). The candidate
+    with the highest link probability wins; at or above threshold the
+    proposal becomes an `extends` link to it at CONFIRM_LINK_STRENGTH,
+    otherwise the proposal stands. No skip path: a decision model is not
+    asked whether the proposed topic is right-sized.
     """
     usable = [s for s in scores if isinstance(s.get("link_probability"), (int, float)) and s.get("topic_id")]
-    note_head = "\n\nCONFIRMATION PASS (jev): "
+    note_head = "\n\nCONFIRMATION PASS (decision model): "
     if not usable:
         parsed["confirmation"] = "confirmed_new"
         parsed["reasoning_trace"] = (parsed.get("reasoning_trace") or "") + note_head + "no candidate scores available; keeping propose_new."
-        logger.info("  confirmation=confirmed_new (jev) no candidate scores available")
+        logger.info("  confirmation=confirmed_new (decision model) no candidate scores available")
         return parsed
     best = max(usable, key=lambda s: s["link_probability"])
     ranked = ", ".join(
@@ -907,7 +908,7 @@ def _apply_jev_confirmation(parsed: dict, scores: list[dict], threshold: float) 
         parsed["new_topic"] = None
         parsed["confirmation"] = "overridden_to_link"
         note = (
-            f"first pass proposed a new topic; Jev scored p(belongs)={best['link_probability']:.2f} "
+            f"first pass proposed a new topic; the decision model scored p(belongs)={best['link_probability']:.2f} "
             f"(relationship {best.get('label')}, confidence {best.get('confidence')}) for "
             f"'{best['topic_id']}', above the {threshold} threshold. Strength fixed at "
             f"{CONFIRM_LINK_STRENGTH} (edge extension). All scores: {ranked}"
@@ -915,10 +916,10 @@ def _apply_jev_confirmation(parsed: dict, scores: list[dict], threshold: float) 
     else:
         parsed["confirmation"] = "confirmed_new"
         note = f"no candidate reached p(belongs) {threshold}; best {best['topic_id']}={best['link_probability']:.2f}. All scores: {ranked}"
-    parsed["jev_scores"] = usable
+    parsed["decision_scores"] = usable
     parsed["reasoning_trace"] = (parsed.get("reasoning_trace") or "") + note_head + note
     logger.info(
-        "  confirmation=%s (jev) best=%s p=%.2f threshold=%.2f",
+        "  confirmation=%s (decision model) best=%s p=%.2f threshold=%.2f",
         parsed["confirmation"], best["topic_id"], best["link_probability"], threshold,
     )
     return parsed
@@ -936,11 +937,9 @@ def _confirm_proposal_decision(
 ) -> dict:
     """Decision-model review of a propose_new decision: score each shown
     candidate as an item-topic pair and demote on a confident match."""
-    from topicsleuth.backends import jev
-
     if decision_model is None:
         logger.warning("confirm_backend=decision but no decision model was supplied; keeping propose_new")
-        return _apply_jev_confirmation(parsed, [], settings.synthesize.confirm_link_threshold)
+        return _apply_decision_confirmation(parsed, [], settings.synthesize.confirm_link_threshold)
     shown = _confirmation_candidates(
         parsed, vector_candidates, all_candidates, settings.synthesize.confirm_candidates
     )
@@ -950,13 +949,12 @@ def _confirm_proposal_decision(
         topic = dict(c)
         topic["evidence_count"] = _get_evidence_count(c)
         try:
-            sc = jev.score_pair(decision_model, item, topic, reps)
+            score = decision_model.score_pair(item, topic, reps)
         except Exception as e:
             logger.warning("decision model call failed for %s: %s", c["topic_id"], e)
             continue
-        sc["topic_id"] = c["topic_id"]
-        scores.append(sc)
-    return _apply_jev_confirmation(parsed, scores, settings.synthesize.confirm_link_threshold)
+        scores.append({"topic_id": c["topic_id"], **asdict(score)})
+    return _apply_decision_confirmation(parsed, scores, settings.synthesize.confirm_link_threshold)
 
 
 def _confirm_proposal(
@@ -1281,7 +1279,7 @@ def _build_diagnostics(
 
     return {
         "confirmation": parsed.get("confirmation"),
-        "jev_scores": parsed.get("jev_scores"),
+        "decision_scores": parsed.get("decision_scores"),
         "confirm_input_tokens": getattr(confirm_response, "input_tokens", None),
         "confirm_output_tokens": getattr(confirm_response, "output_tokens", None),
         "vector_candidates": len(vector_candidates),

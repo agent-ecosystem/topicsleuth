@@ -4,6 +4,11 @@ Topics live in one collection with an Atlas Vector Search index over their
 ``embedding`` field; observations in another. Item embeddings are kept on
 the item documents of a third collection, which a feeder usually owns, so
 the only fields this store touches there are ``url`` and ``embedding``.
+
+MongoDB stores datetimes without a zone and pymongo returns them naive by
+default; this store reads every collection with a timezone-aware codec so
+dates come back as UTC, as the Store contract requires, whichever client
+it is handed.
 """
 from __future__ import annotations
 
@@ -26,6 +31,7 @@ class MongoStore:
         num_candidates: int = 200,
     ):
         try:
+            from bson.codec_options import CodecOptions
             from pymongo import ASCENDING
             from pymongo.errors import ConnectionFailure, OperationFailure
         except ImportError as e:  # pragma: no cover
@@ -33,9 +39,10 @@ class MongoStore:
         names = {**DEFAULT_COLLECTIONS, **(collections or {})}
         self.client = client
         self.db = client[database]
-        self.topics = self.db[names["topics"]]
-        self.observations = self.db[names["observations"]]
-        self.items = self.db[names["items"]]
+        utc = CodecOptions(tz_aware=True, tzinfo=timezone.utc)
+        self.topics = self.db[names["topics"]].with_options(codec_options=utc)
+        self.observations = self.db[names["observations"]].with_options(codec_options=utc)
+        self.items = self.db[names["items"]].with_options(codec_options=utc)
         self.vector_index = vector_index
         self.num_candidates = num_candidates
         try:
