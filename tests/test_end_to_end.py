@@ -55,8 +55,9 @@ def _item(url="u1", **extra):
 
 LINK = {
     "candidate_classifications": [{"topic_id": "a", "candidate_question": "A?", "item_question": "A?", "label": "same_question"}],
-    "decision": "link_existing", "topic_id": "a", "connection_type": "supports",
-    "fit_questions": {"q1_scope_expansion": False, "q2_representative_citation": True, "q3_distinguishing_evidence": True},
+    "decision": "link_existing",
+    "links": [{"topic_id": "a", "connection_type": "supports",
+               "fit_questions": {"q1_scope_expansion": False, "q2_representative_citation": True, "q3_distinguishing_evidence": True}}],
     "reasoning_trace": "fits A",
 }
 PROPOSE = {
@@ -151,7 +152,8 @@ def test_gate_forces_link_when_model_proposes_despite_same_question():
 
 def test_second_item_can_link_to_a_topic_proposed_earlier_in_the_batch():
     st, emb, s = _store(), HashEmbedder(DIM), _settings()
-    link_c = dict(LINK, candidate_classifications=[{"topic_id": "topic-c", "label": "same_question"}], topic_id="topic-c")
+    link_c = dict(LINK, candidate_classifications=[{"topic_id": "topic-c", "label": "same_question"}],
+                  links=[dict(LINK["links"][0], topic_id="topic-c")])
     judge = ScriptedJudge([PROPOSE, CONFIRM, link_c])
     items, evals = [_item("u1"), _item("u2")], [_Eval("u1", E_B), _Eval("u2", E_B)]
     decisions = synthesize_items(items, evals, st, s, judge, emb)
@@ -196,7 +198,6 @@ def test_leave_one_out_hides_the_items_own_singleton_topic():
     st.create_observation({"topic_id": "mine", "item_url": "u1", "item_title": "Item u1"})
     st.create_topic({"topic_id": "other", "title": "Other", "summary": "o", "embedding": E_B})
     st.create_observation({"topic_id": "other", "item_url": "u9", "item_title": "Item u9"})
-    st.create_observation({"topic_id": "other", "item_url": "u1", "item_title": "Item u1"})
     judge = ScriptedJudge([{"decision": "skip", "candidate_classifications": [], "reasoning_trace": "x"}])
     synthesize_item(_item("u1"), _Eval("u1", E_A), st, _settings(), judge, [], leave_one_out=True)
     user = judge.calls[0][1]

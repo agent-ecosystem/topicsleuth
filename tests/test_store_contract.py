@@ -159,14 +159,22 @@ def test_delete_since(store):
     assert sorted(o["item_url"] for o in store.list_observations()) == ["u1", "u3"]
 
 
-def test_observation_identity_is_one_per_item_and_topic(store):
+def test_an_item_is_evidence_for_a_topic_once(store):
     from topicsleuth.interfaces import DuplicateObservation, DuplicateTopic
     _seed(store)
-    store.create_observation({"topic_id": "a", "item_url": "u1"})
+    oid = store.create_observation({"topic_id": "a", "item_url": "u1"})
     with pytest.raises(DuplicateObservation):
         store.create_observation({"topic_id": "a", "item_url": "u1", "strength": 0.9})
-    store.create_observation({"topic_id": "b", "item_url": "u1"}), "the same item on another topic is a different observation"
-    assert store.count_observations_for_topic("a") == 1
+    on_b = store.create_observation({"topic_id": "b", "item_url": "u1"})
+    assert len(store.get_observations_for_item("u1")) == 2, "the same item on another topic is another observation"
+    with pytest.raises(DuplicateObservation):
+        store.update_observation(oid, {"topic_id": "b"})
+    other = store.create_observation({"topic_id": "b", "item_url": "u2"})
+    with pytest.raises(DuplicateObservation):
+        store.update_observation(other, {"item_url": "u1"})
+    store.update_observation(other, {"strength": 0.5}), "an update that keeps the pair is fine"
+    assert store.delete_observation(on_b) and not store.delete_observation(on_b)
+    assert sorted(o["item_url"] for o in store.list_observations()) == ["u1", "u2"]
     with pytest.raises(DuplicateTopic):
         store.create_topic({"topic_id": "a", "title": "again"})
 

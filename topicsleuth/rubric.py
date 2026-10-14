@@ -307,12 +307,13 @@ DECISIONS = ("link_existing", "propose_new", "skip")
 # subset-question candidate is overridden to link.
 DECISION_RULES = (
     "Apply these rules in order. Do not skip ahead.\n\n"
-    "1. If any candidate is `same_question`, link_existing to it. If multiple, "
-    "pick the one with the most evidence (convergence beats fragmentation).\n"
-    "2. Else if any candidate is `subset_question`, link_existing to it. "
-    "Subset_question is the right home for items that are specific instances of "
-    "an existing direction; this is not a reason to spawn a more specific "
-    "sibling.\n"
+    "1. If any candidate is `same_question`, link_existing to every such "
+    "candidate. A document is evidence for each question it genuinely bears "
+    "on; link to each of those, not to every topic that shares its subject.\n"
+    "2. Else if any candidate is `subset_question`, link_existing to every such "
+    "candidate. Subset_question is the right home for items that are specific "
+    "instances of an existing direction; this is not a reason to spawn a more "
+    "specific sibling.\n"
     "3. Else (all candidates are `adjacent_question` or `surface_overlap`):\n"
     "   - If the item bears on a question that is itself right-sized (per the "
     "rubric above) and is genuinely distinct from every adjacent candidate's "
@@ -327,8 +328,8 @@ SURVEYS = (
     "X\" meta-topic. Do not do this. A survey or overview is a subset of every "
     "topic it covers, not a superset. The question of a survey is whichever "
     "subset_question candidate the survey most centrally treats. If multiple "
-    "candidates are subset matches, link to the one with the most evidence (the "
-    "survey is then a strong piece of representative evidence for that topic). "
+    "candidates are subset matches, link to each of them (the survey is then a "
+    "strong piece of representative evidence for each). "
     "Meta-topics named \"comprehensive X\" or \"everything about Y\" produce "
     "catch-alls and should be avoided."
 )
@@ -365,9 +366,9 @@ FIT_QUESTIONS = {
 }
 
 FIT_INSTRUCTIONS = (
-    "Do not produce a strength number directly. Answer three independent yes/no "
-    "questions about the item-topic relationship. The questions describe "
-    "structural properties, not quality."
+    "Do not produce a strength number directly. For each topic you link to, "
+    "answer three independent yes/no questions about that item-topic "
+    "relationship. The questions describe structural properties, not quality."
 )
 
 FIT_CLOSING = (
@@ -415,8 +416,8 @@ def derive_strength(fit_questions: dict | None) -> float | None:
 # (0.95) in tuning runs, which is agreement with itself, not calibration.
 # What these links are is known by construction: an item the first pass
 # judged distinct enough to want its own topic, pulled back as an edge
-# extension. That is real scope evidence, so it stays above the 0.7 minor
-# floor for mature topics (record.STRENGTH_FLOORS), but it should not
+# extension. That is real scope evidence, so it stays above the default
+# minor floor for well-evidenced topics (settings.record), but it should not
 # outrank a topic's core observations (0.80/0.95) when representative
 # examples are chosen.
 CONFIRM_LINK_STRENGTH = 0.70
@@ -479,11 +480,15 @@ DECISION_RESPONSE_FORMAT = (
     "    }\n"
     "  ],\n"
     f'  "decision": {_enum(DECISIONS)},\n'
-    '  "topic_id": "<existing topic_id if link_existing, null otherwise>",\n'
-    f'  "connection_type": {_enum(CONNECTION_TYPES)} | null,\n'
-    '  "fit_questions": {\n'
-    f"{_fit_questions_json()}\n"
-    "  },\n"
+    '  "links": [\n'
+    "    {\n"
+    '      "topic_id": "<existing topic_id>",\n'
+    f'      "connection_type": {_enum(CONNECTION_TYPES)},\n'
+    '      "fit_questions": {\n'
+    f"{_fit_questions_json(indent='        ')}\n"
+    "      }\n"
+    "    }\n"
+    "  ],\n"
     '  "reasoning_trace": "<short explanation of the decision>",\n'
     '  "new_topic": {\n'
     '    "title": "<if propose_new>",\n'
@@ -496,8 +501,9 @@ DECISION_RESPONSE_FORMAT = (
     "  }\n"
     "}\n\n"
     "Include all evaluated candidates in candidate_classifications. Provide "
-    "fit_questions only when decision is link_existing; omit or set to null "
-    "otherwise. Provide new_topic only when decision is propose_new."
+    "links only when decision is link_existing, one entry per topic the item is "
+    "evidence for, each with its own connection type and fit answers; omit or "
+    "set to null otherwise. Provide new_topic only when decision is propose_new."
 )
 
 
@@ -513,9 +519,9 @@ def _decision_steps(rubric: RubricConfig, step1_heading: str, step1_intro: str, 
     return (
         f"{step1}\n\n"
         f"## Step 2: Decide\n\n{DECISION_RULES}\n\n"
-        f"## Step 3: Strength assessment (link_existing only)\n\n"
+        f"## Step 3: Strength assessment (link_existing only, once per link)\n\n"
         f"{FIT_INSTRUCTIONS}\n\n{fit_questions_text()}\n\n{FIT_CLOSING}\n\n"
-        f"## Step 4: Connection type (link_existing only)\n\n{connection_types_text()}"
+        f"## Step 4: Connection type (link_existing only, once per link)\n\n{connection_types_text()}"
     )
 
 

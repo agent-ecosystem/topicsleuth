@@ -106,12 +106,14 @@ for failure in result.failures:        # retry these next run; do not mark them 
     print(f"{failure.item_url} failed at {failure.stage}: {failure.error}")
 ```
 
-Recording is safe to retry. An observation is identified by its document
-and topic, so running the same batch twice, or two programs admitting the
-same document, writes it once. A document the judge or the store could
-not finish is listed in `result.failures` with the stage it stopped at,
-and nothing is written for it, so keep it in your queue and hand it over
-again next run.
+Recording is safe to retry. A document is evidence for a topic once: the
+store holds one observation per document per topic, so running the same
+batch twice, or two programs admitting the same document, writes it once,
+and a document the store already holds is not judged again. A document that could not be
+finished is listed in `result.failures` with the stage it stopped at.
+Keep it in your queue and hand it over again next run: every stage is
+idempotent, so the retry completes what the failed run left undone (a
+snapshot, a status, an embedding) without repeating what it did.
 
 ## Keep track of content across days, not just today
 
@@ -129,10 +131,12 @@ right size for a page: specific enough that a document clearly belongs
 on it or not, but also broad enough to gather evidence for months.
 
 When you let topicsleuth keep that notebook, each piece of content that
-bears on a question becomes an **observation** on that topic's page. An
-observation records which document it was, how strongly it bears on the
-question, and a label that says how it connects to what's already in the
-topic. The label is there so you can see at a glance when you open a topic
+bears on a question becomes an **observation** on that topic's page. A
+document that bears on two questions, say a paper that is both about
+evaluation design and about how a coding harness runs commands, gets an
+entry on both pages, each judged on its own. An observation records which
+document it was, how strongly it bears on the question, and a label that
+says how it connects to what's already in the topic. The label is there so you can see at a glance when you open a topic
 which entries agree with each other and which ones pushed the question
 somewhere new. An observation can relate to its topic in one of four ways:
 
@@ -157,7 +161,8 @@ stops arriving:
   evidence.
 - **mature**: twenty or more observations, a well-established thread. From
   here on, a weak match (strength below 0.7) is still filed but marked
-  minor, so a mature topic does not drift on tangential links.
+  minor, so a mature topic does not drift on tangential links. Both numbers
+  are settings, under `record`.
 - **fading**: an active or mature topic that has gone a week with no new
   evidence. Fresh evidence sends it back to active.
 - **dormant**: a fading topic whose last evidence is more than thirty days
@@ -215,10 +220,10 @@ the **judge**, the document and the similar topics, each with its
 one-sentence summary and a few of the entries already on it. The lib asks
 the judge if the document's question is the same as the existing topic,
 a narrower case of it, a neighbor of it, or does it only share vocabulary?
-If any similar topic is the same question or a narrower case, the document
-goes there as an observation on that existing topic. If none is, the judge
-may propose a new topic, or decide the document is interesting but not the
-start of anything.
+The document goes on the page of every similar topic that is the same
+question or a narrower case, as an observation on each, scored for each.
+If there is none, the judge may propose a new topic, or decide the
+document is interesting but not the start of anything.
 
 The sandbox changelog lands on "are coding tools isolating what agents
 execute by default?", even though every other entry on that page is a
@@ -319,7 +324,9 @@ so you can try a value before you keep it.
   and `confirm_backend` picks the judge's second call or a decision model
   with `confirm_link_threshold` as its bar. These change how many
   proposals survive without touching the rubric. Flags: `--no-confirm`,
-  `--confirm-backend`, `--confirm-threshold`.
+  `--confirm-backend`, `--confirm-threshold`. In the same group,
+  `secondary_link_floor` drops a document's second or later link when its
+  strength is below the floor, and `--secondary-link-floor` tries one.
 - **The prose about your field.** `domain` and the `rubric` block from
   "Tell it what you're interested in". Counter-examples are the working lever: a
   replay shows you the decisions the judge gets wrong, and one
@@ -376,6 +383,19 @@ the `rubric` block, check it with `show-prompts`, and take a fresh
 baseline, because every comparison from before was made by a different
 judge.
 
+### Weak secondary links
+
+A document that bears on two questions is filed on both pages, and the
+second link is often the weaker one: the judge said the question is the
+same but answered the fit questions "no". On a well-evidenced topic that
+entry is marked minor, which is correct, but a page can fill with minor
+entries from documents whose main home is elsewhere. The report's
+`LINKS` line shows how many links were secondary, their strength
+buckets, and how many a floor dropped. Set `synthesize.secondary_link_floor`
+a step at a time (0.5 drops the "all three no" and "not citable" bands)
+and replay both seeds; a replayed report shows what each value would
+have dropped without a new model call. The first link is never dropped.
+
 ### It costs too much
 
 `mean input tokens per call` in the report is the bill. The candidate
@@ -414,11 +434,20 @@ topicsleuth seed topics.yaml                    # start an empty store from a li
 topicsleuth clean --hours 28                    # remove what the last run wrote
 ```
 
-Nothing here re-judges a document. Merging, moving and splitting keep each
-entry's identity, date, strength and connection type and note where it
-came from, and a retired topic keeps a pointer to what replaced it, so old
-links still resolve. A split is checked in full before anything is
-written: every entry assigned exactly once, to a sub-topic that exists.
+Nothing here re-judges a document, except that a split asks the judge to
+re-assess each entry's strength and connection type against its narrower
+sub-topic. Merging and moving keep both. All three keep each entry's
+identity, date and metadata and note where it came from, and a retired
+topic keeps a pointer to what replaced it, so old links still resolve. A
+document that was evidence on both sides of a merge or move keeps the
+target's entry, with the other folded into it and noted. A
+split is checked in full before anything is written: every entry assigned
+exactly once, to a sub-topic that exists, with a known connection type.
+
+These commands may run while a feeder is writing. Neither side locks the
+store; instead, recording verifies its destination after writing and
+follows a merge or withdraws from a retired or deleted topic, and a merge
+or split carries along anything that arrived while it ran.
 
 `clean` removes the observations, topics and snapshots written in a
 window, by when they were written rather than when their evidence
@@ -469,6 +498,10 @@ synthesize:
   confirm_candidates: 5                # how many nearest topics the reviewer sees
   confirm_backend: judge               # judge | decision
   confirm_link_threshold: 0.7          # decision backend: how sure it must be to fold a proposal in
+  secondary_link_floor: 0.0            # drop a document's second or later link below this strength
+record:
+  minor_floor_after: 20                # from this many observations on a topic...
+  minor_floor_strength: 0.7            # ...a new one below this strength is marked minor
 ```
 
 Loading history rather than today's documents? Pass `date_from_item=True`

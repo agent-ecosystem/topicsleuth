@@ -4,7 +4,7 @@ import json
 import logging
 from typing import Protocol
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 from topicsleuth.interfaces import DecisionModel, Embedder, Judge, Store
 from topicsleuth.settings import Settings
@@ -15,6 +15,7 @@ from topicsleuth.rubric import (
     DEFAULT_CONNECTION_TYPE,
     GATE_OVERRIDE_DEFAULT_STRENGTH,
     REVIEWER_CONNECTION_TYPE,
+    FIT_QUESTIONS,
     derive_strength,
     cold_start_system_prompt,
     confirm_system_prompt,
@@ -43,15 +44,40 @@ class DecisionError(ValueError):
 
 
 @dataclass
+class Link:
+    """One topic an item is evidence for, with the judge's assessment of
+    that relationship. A link decision carries one or more."""
+    topic_id: str
+    connection_type: str
+    strength: float
+    fit_questions: dict | None = None
+
+
+@dataclass
 class SynthesisDecision:
     item_url: str
     item_title: str
     decision: str  # link_existing, propose_new, skip, or failed
+    # The first link, for readers that want one topic; ``links`` has them all.
     topic_id: str | None
     connection_type: str | None
     strength: float
     reasoning_trace: str
+    links: list[Link] = field(default_factory=list)
     new_topic: dict | None = None
+
+    def __post_init__(self):
+        # One invariant, whichever way the decision was built: for a link
+        # decision, ``links`` holds every topic and the three scalar fields
+        # mirror its first entry.
+        if self.decision == "link_existing":
+            if not self.links and self.topic_id:
+                self.links = [Link(topic_id=self.topic_id,
+                                   connection_type=self.connection_type or DEFAULT_CONNECTION_TYPE,
+                                   strength=self.strength)]
+            if self.links:
+                first = self.links[0]
+                self.topic_id, self.connection_type, self.strength = first.topic_id, first.connection_type, first.strength
     # Non-persisted retrieval/prompt facts for the tuning harness: candidate
     # counts per channel, vector scores, token usage, classification labels.
     diagnostics: dict | None = None
@@ -405,7 +431,8 @@ def _unique_topic_id(topic_id: str, store: Store, proposed_topics: list[dict]) -
     return candidate
 
 
-def _validate_decision(parsed: dict, shown_ids: set[str], store: Store, proposed_topics: list[dict]) -> dict:
+def _validate_decision(parsed: dict, shown_ids: set[str], store: Store, proposed_topics: list[dict],
+                       settings: Settings | None = None) -> dict:
     """Enforce the response contract on a parsed decision. Raises
     DecisionError for anything that must not be written; normalizes the
     rest (connection type, proposal fields, slug uniqueness)."""
@@ -414,24 +441,44 @@ def _validate_decision(parsed: dict, shown_ids: set[str], store: Store, proposed
         raise DecisionError(f"unknown decision {decision!r}")
 
     if decision == "link_existing":
-        topic_id = parsed.get("topic_id")
-        if not topic_id or topic_id not in shown_ids:
-            raise DecisionError(f"link to {topic_id!r}, which was not among the shown candidates")
-        scored = (
-            derive_strength(parsed.get("fit_questions")) is not None
-            or parsed.get("gate_override")
-            or parsed.get("confirmation") == "overridden_to_link"
-        )
-        if not scored:
-            raise DecisionError("link_existing without the three fit questions answered")
-        strength = parsed.get("strength")
-        if not isinstance(strength, (int, float)) or strength != strength or not 0.0 <= strength <= 1.0:
-            raise DecisionError(f"strength {strength!r} is not a number in [0, 1]")
-        ctype = parsed.get("connection_type")
-        if ctype is None:
-            parsed["connection_type"] = DEFAULT_CONNECTION_TYPE
-        elif ctype not in CONNECTION_TYPES:
-            raise DecisionError(f"unknown connection_type {ctype!r}")
+        links = parsed.get("links") or []
+        if not links:
+            raise DecisionError("link_existing with no links")
+        fixed = parsed.get("gate_override") or parsed.get("confirmation") == "overridden_to_link"
+        seen: set[str] = set()
+        kept = []
+        for link in links:
+            topic_id = link.get("topic_id")
+            if not topic_id or topic_id not in shown_ids:
+                raise DecisionError(f"link to {topic_id!r}, which was not among the shown candidates")
+            if topic_id in seen:
+                continue
+            seen.add(topic_id)
+            if link.get("strength") is None and not fixed:
+                raise DecisionError(f"link to {topic_id!r} without the three fit questions answered")
+            strength = link.get("strength")
+            if not isinstance(strength, (int, float)) or strength != strength or not 0.0 <= strength <= 1.0:
+                raise DecisionError(f"strength {strength!r} is not a number in [0, 1]")
+            ctype = link.get("connection_type")
+            if ctype is None:
+                link["connection_type"] = DEFAULT_CONNECTION_TYPE
+            elif ctype not in CONNECTION_TYPES:
+                raise DecisionError(f"unknown connection_type {ctype!r}")
+            kept.append(link)
+        # The first link always stands. A later one below the secondary
+        # floor is dropped: the judge said the item bears on that question
+        # too, but not strongly enough for this store to file it.
+        floor = settings.synthesize.secondary_link_floor if settings else 0.0
+        dropped = [l for l in kept[1:] if l["strength"] < floor]
+        if dropped:
+            kept = [kept[0]] + [l for l in kept[1:] if l["strength"] >= floor]
+            parsed["dropped_links"] = dropped
+            parsed["reasoning_trace"] = (parsed.get("reasoning_trace") or "") + (
+                "\n\nSECONDARY LINKS DROPPED (below floor "
+                f"{floor}): " + ", ".join(f"{l['topic_id']} at {l['strength']}" for l in dropped)
+            )
+        parsed["links"] = kept
+        parsed["strength"] = kept[0]["strength"]
         parsed["new_topic"] = None
 
     elif decision == "propose_new":
@@ -454,12 +501,10 @@ def _validate_decision(parsed: dict, shown_ids: set[str], store: Store, proposed
         for key in ("tags", "suggested_directions"):
             value = new_topic.get(key)
             new_topic[key] = [str(v) for v in value] if isinstance(value, list) else []
-        parsed["topic_id"] = None
-        parsed["connection_type"] = None
+        parsed["links"] = []
 
     else:  # skip
-        parsed["topic_id"] = None
-        parsed["connection_type"] = None
+        parsed["links"] = []
         parsed["new_topic"] = None
         parsed["strength"] = 0.0
 
@@ -473,9 +518,9 @@ def _enforce_link_gate(parsed: dict, all_candidates: list[dict]) -> dict:
     any candidate is rated `same_question` or `subset_question`, but the model
     sometimes overrides that instruction with its own judgment (e.g. for
     survey papers that subsume multiple subset candidates). The reliable fix
-    is to enforce the gate in code: if propose_new is paired with one or more
-    same/subset classifications, force a link to the highest-evidence-count
-    match, prefer same_question over subset_question.
+    is to enforce the gate in code: if propose_new is paired with same or
+    subset classifications, force links to every same_question candidate, or
+    failing that every subset_question candidate, most evidence first.
 
     Strength is set to the default since the model didn't produce
     fit_questions for the propose_new path. The reasoning_trace is annotated
@@ -514,23 +559,29 @@ def _enforce_link_gate(parsed: dict, all_candidates: list[dict]) -> dict:
         key=lambda c: evidence_for(c.get("topic_id")),
         reverse=True,
     )
-    chosen = pool_sorted[0]
-    target_id = chosen.get("topic_id")
-    if not target_id:
+    targets: list[str] = []
+    for c in pool_sorted:
+        tid = c.get("topic_id")
+        if tid and tid not in targets:
+            targets.append(tid)
+    if not targets:
         return parsed
 
     note = (
         f"\n\nGATE OVERRIDE: model proposed a new topic but rated "
         f"{len(pool)} candidate(s) as "
         f"{'same_question' if same_matches else 'subset_question'}. "
-        f"Forced link to '{target_id}' "
-        f"(evidence_count={evidence_for(target_id)}). "
+        f"Forced links to {targets} "
+        f"(evidence_count {[evidence_for(t) for t in targets]}). "
         f"Strength defaulted to {GATE_OVERRIDE_DEFAULT_STRENGTH} since "
         f"fit_questions were not produced under the propose_new path."
     )
     parsed["decision"] = "link_existing"
-    parsed["topic_id"] = target_id
-    parsed["connection_type"] = DEFAULT_CONNECTION_TYPE
+    parsed["links"] = [
+        {"topic_id": t, "connection_type": DEFAULT_CONNECTION_TYPE,
+         "fit_questions": None, "strength": GATE_OVERRIDE_DEFAULT_STRENGTH}
+        for t in targets
+    ]
     parsed["strength"] = GATE_OVERRIDE_DEFAULT_STRENGTH
     parsed["new_topic"] = None
     parsed["reasoning_trace"] = (parsed.get("reasoning_trace", "") or "") + note
@@ -538,7 +589,7 @@ def _enforce_link_gate(parsed: dict, all_candidates: list[dict]) -> dict:
 
     logger.info(
         "Gate override: propose_new -> link_existing %s (had %d same/subset matches)",
-        target_id, len(pool),
+        targets, len(pool),
     )
     return parsed
 
@@ -599,10 +650,12 @@ def _apply_confirmation(parsed: dict, confirm: dict, candidate_ids: set[str]) ->
         target = _sanitize_topic_id(confirm.get("topic_id") or "")
         if target in candidate_ids:
             parsed["decision"] = "link_existing"
-            parsed["topic_id"] = target
-            parsed["connection_type"] = confirm.get("connection_type") or REVIEWER_CONNECTION_TYPE
+            parsed["links"] = [{
+                "topic_id": target,
+                "connection_type": confirm.get("connection_type") or REVIEWER_CONNECTION_TYPE,
+                "fit_questions": None, "strength": CONFIRM_LINK_STRENGTH,
+            }]
             parsed["strength"] = CONFIRM_LINK_STRENGTH
-            parsed["fit_questions"] = None
             parsed["new_topic"] = None
             note = (
                 f"first pass proposed a new topic; independent reviewer judged "
@@ -621,8 +674,7 @@ def _apply_confirmation(parsed: dict, confirm: dict, candidate_ids: set[str]) ->
             parsed["confirmation"] = "confirmed_new"
     elif verdict == "skip":
         parsed["decision"] = "skip"
-        parsed["topic_id"] = None
-        parsed["connection_type"] = None
+        parsed["links"] = []
         parsed["strength"] = 0.0
         parsed["new_topic"] = None
         note = (
@@ -666,10 +718,9 @@ def _apply_decision_confirmation(parsed: dict, scores: list[dict], threshold: fl
     )
     if best["link_probability"] >= threshold:
         parsed["decision"] = "link_existing"
-        parsed["topic_id"] = best["topic_id"]
-        parsed["connection_type"] = REVIEWER_CONNECTION_TYPE
+        parsed["links"] = [{"topic_id": best["topic_id"], "connection_type": REVIEWER_CONNECTION_TYPE,
+                            "fit_questions": None, "strength": CONFIRM_LINK_STRENGTH}]
         parsed["strength"] = CONFIRM_LINK_STRENGTH
-        parsed["fit_questions"] = None
         parsed["new_topic"] = None
         parsed["confirmation"] = "overridden_to_link"
         note = (
@@ -757,21 +808,25 @@ def _confirm_proposal(
 def _parse_decision(raw_text: str) -> dict:
     parsed = _robust_json_parse(raw_text)
 
-    # Sanitize topic_ids
-    if parsed.get("topic_id"):
-        parsed["topic_id"] = _sanitize_topic_id(parsed["topic_id"])
     if parsed.get("new_topic") and parsed["new_topic"].get("topic_id"):
         parsed["new_topic"]["topic_id"] = _sanitize_topic_id(parsed["new_topic"]["topic_id"])
 
-    # Derive strength from fit_questions for link_existing decisions. The
-    # model is instructed not to emit strength directly, but if it does (legacy
-    # behavior), the derived value wins when fit_questions are present.
+    # A link decision names every topic the item is evidence for, each with
+    # its own fit answers; strength is derived per link, never emitted.
     if parsed.get("decision") == "link_existing":
-        derived = derive_strength(parsed.get("fit_questions"))
-        if derived is not None:
-            parsed["strength"] = derived
-        elif parsed.get("strength") is None:
-            parsed["strength"] = 0.0
+        links = []
+        for raw in parsed.get("links") if isinstance(parsed.get("links"), list) else []:
+            if not isinstance(raw, dict):
+                continue
+            fit = raw.get("fit_questions") if isinstance(raw.get("fit_questions"), dict) else None
+            links.append({
+                "topic_id": _sanitize_topic_id(str(raw.get("topic_id") or "")),
+                "connection_type": raw.get("connection_type"),
+                "fit_questions": fit,
+                "strength": derive_strength(fit),
+            })
+        parsed["links"] = links
+        parsed["strength"] = links[0]["strength"] if links and links[0]["strength"] is not None else 0.0
     elif parsed.get("decision") == "propose_new":
         # The founding observation links the proposing item to a brand-new
         # topic. By construction the item is the central evidence motivating
@@ -806,15 +861,15 @@ def _parse_decision(raw_text: str) -> dict:
                 lines.append(f"    item_question: {iq}")
         extras.append("\n".join(lines))
 
-    fit_questions = parsed.get("fit_questions")
-    if isinstance(fit_questions, dict) and parsed.get("decision") == "link_existing":
-        lines = ["Fit questions:"]
-        for k in ("q1_scope_expansion", "q2_representative_citation",
-                 "q3_distinguishing_evidence"):
-            v = fit_questions.get(k)
-            lines.append(f"  {k}: {v}")
-        lines.append(f"  derived_strength: {parsed.get('strength')}")
-        extras.append("\n".join(lines))
+    if parsed.get("decision") == "link_existing":
+        for link in parsed.get("links") or []:
+            if not isinstance(link.get("fit_questions"), dict):
+                continue
+            lines = [f"Fit questions for {link['topic_id']}:"]
+            for k in FIT_QUESTIONS:
+                lines.append(f"  {k}: {link['fit_questions'].get(k)}")
+            lines.append(f"  derived_strength: {link['strength']}")
+            extras.append("\n".join(lines))
 
     new_topic = parsed.get("new_topic") or {}
     scope_q = new_topic.get("scope_test_question")
@@ -940,21 +995,23 @@ def synthesize_item(
                 store, settings, judge, exclude_url,
             )
 
-    parsed = _validate_decision(parsed, shown_ids, store, proposed_topics)
+    parsed = _validate_decision(parsed, shown_ids, store, proposed_topics, settings)
 
     diagnostics = _build_diagnostics(
         parsed, vector_candidates, tag_candidates, candidates, proposed_topics,
         response, confirm_response,
     )
 
+    links = [Link(**link) for link in parsed.get("links") or []]
     return SynthesisDecision(
         item_url=item["url"],
         item_title=item.get("title", ""),
         decision=parsed["decision"],
-        topic_id=parsed.get("topic_id"),
-        connection_type=parsed.get("connection_type"),
+        topic_id=links[0].topic_id if links else None,
+        connection_type=links[0].connection_type if links else None,
         strength=parsed.get("strength", 0.0),
         reasoning_trace=parsed.get("reasoning_trace", ""),
+        links=links,
         new_topic=parsed.get("new_topic") if parsed["decision"] == "propose_new" else None,
         diagnostics=diagnostics,
     )
@@ -1001,7 +1058,8 @@ def _build_diagnostics(
                 "from_batch": tid in batch_ids,
             })
 
-    chosen = parsed.get("topic_id") if parsed.get("decision") == "link_existing" else None
+    links = parsed.get("links") or []
+    chosen = links[0]["topic_id"] if parsed.get("decision") == "link_existing" and links else None
     if chosen in vector_rank:
         chosen_channel = "vector"
     elif chosen in batch_ids:
@@ -1029,6 +1087,7 @@ def _build_diagnostics(
         "chosen_vector_score": vector_score_by_id.get(chosen) if chosen else None,
         "classified": labels,
         "gate_override": bool(parsed.get("gate_override")),
+        "dropped_links": [{"topic_id": l["topic_id"], "strength": l["strength"]} for l in parsed.get("dropped_links") or []],
         "input_tokens": getattr(response, "input_tokens", None),
         "output_tokens": getattr(response, "output_tokens", None),
     }
@@ -1068,6 +1127,22 @@ def synthesize_items(
             len(above_threshold),
             item.get("title", "")[:60],
         )
+        # An item the store already holds was decided by an earlier run (a
+        # retry after a late failure, or another feeder). The stored
+        # observation is that decision; the judge is not asked again, so a
+        # retry cannot pick a different topic or open a second one.
+        existing = store.get_observations_for_item(item["url"])
+        if existing:
+            links = [Link(topic_id=o["topic_id"], connection_type=o.get("connection_type") or DEFAULT_CONNECTION_TYPE,
+                          strength=o.get("strength") or 0.0, fit_questions=o.get("fit_questions")) for o in existing]
+            logger.info("  already recorded on %s; not re-judged", [l.topic_id for l in links])
+            decisions.append(SynthesisDecision(
+                item_url=item["url"], item_title=item.get("title", ""), decision="link_existing",
+                topic_id=links[0].topic_id, connection_type=links[0].connection_type, strength=links[0].strength,
+                reasoning_trace=f"ALREADY RECORDED on {[l.topic_id for l in links]} at {existing[0].get('recorded_at')}; the judge was not called.",
+                links=links,
+            ))
+            continue
         try:
             decision = synthesize_item(
                 item, eval_result, store, settings, judge, proposed_topics,

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from topicsleuth.record import _strength_floor, _topical_tags
-from topicsleuth.settings import Settings
+from topicsleuth.settings import Settings, load_settings
 
 
 @dataclass
@@ -18,16 +18,22 @@ class _Eval:
 
 class TestStrengthFloor:
     def test_below_threshold_no_floor(self):
-        assert _strength_floor(0) is None
-        assert _strength_floor(1) is None
-        assert _strength_floor(19) is None
+        s = load_settings()
+        assert _strength_floor(0, s) is None
+        assert _strength_floor(1, s) is None
+        assert _strength_floor(19, s) is None
 
     def test_at_threshold_returns_floor(self):
-        assert _strength_floor(20) == 0.7
+        assert _strength_floor(20, load_settings()) == 0.7
 
     def test_above_threshold_returns_floor(self):
-        assert _strength_floor(50) == 0.7
-        assert _strength_floor(100) == 0.7
+        s = load_settings()
+        assert _strength_floor(50, s) == 0.7
+        assert _strength_floor(100, s) == 0.7
+
+    def test_the_floor_is_a_setting(self):
+        s = load_settings(overrides={"record": {"minor_floor_after": 5, "minor_floor_strength": 0.9}})
+        assert _strength_floor(4, s) is None and _strength_floor(5, s) == 0.9
 
 
 class TestTopicalTags:

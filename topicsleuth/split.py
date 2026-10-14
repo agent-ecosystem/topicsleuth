@@ -7,13 +7,14 @@ from datetime import datetime, timezone
 
 from topicsleuth.interfaces import Embedder, Judge, Store
 from topicsleuth.rubric import (
+    CONNECTION_TYPES,
     DEFAULT_CONNECTION_TYPE,
     derive_strength,
     split_propose_system_prompt,
     split_reassign_system_prompt,
 )
 from topicsleuth.settings import Settings
-from topicsleuth.synthesize import _sanitize_topic_id
+from topicsleuth.synthesize import _cosine, _sanitize_topic_id
 
 logger = logging.getLogger(__name__)
 
@@ -98,9 +99,11 @@ def split_topic(
     now = datetime.now(timezone.utc)
 
     # 5. Create sub-topics with embeddings
+    sub_embeddings: dict[str, list[float]] = {}
     for st in sub_topics:
         topic_text = f"{st['title']}\n\n{st['summary']}"
         embedding = embedder.embed_documents([topic_text])[0]
+        sub_embeddings[st["topic_id"]] = embedding
         store.create_topic({
             "topic_id": st["topic_id"],
             "title": st["title"],
@@ -139,6 +142,30 @@ def split_topic(
         "split_into": [st["topic_id"] for st in sub_topics],
     })
     logger.info("Retired topic: %s", topic_id)
+
+    # Anything a concurrent run recorded on the parent since the plan was
+    # made was not in the judge's plan. It goes to the nearest sub-topic by
+    # embedding (or the largest, if the item has no embedding), with a note.
+    late = [o for o in store.get_observations_for_topic(topic_id) if o["item_url"] not in obs_by_url]
+    if late:
+        logger.warning("%d observation(s) arrived on %s during the split; assigning by nearest sub-topic", len(late), topic_id)
+        item_vectors = store.get_item_embeddings([o["item_url"] for o in late])
+        counts = {sid: store.count_observations_for_topic(sid) for sid in sub_embeddings}
+        for o in late:
+            vec = item_vectors.get(o["item_url"])
+            if vec:
+                target = max(sub_embeddings, key=lambda sid: _cosine(vec, sub_embeddings[sid]))
+                how = "nearest sub-topic by embedding"
+            else:
+                target = max(counts, key=counts.get)
+                how = "largest sub-topic (item has no embedding)"
+            store.update_observation(o["_id"], {
+                "topic_id": target, "moved_from": topic_id,
+                "reasoning_trace": (o.get("reasoning_trace") or "")
+                + f"\n\nMOVED by split-topic on {now.date().isoformat()}: arrived during the split; {how}: '{target}'.",
+            })
+            counts[target] += 1
+            moved += 1
 
     # 8. Snapshots for the new sub-topics
     from topicsleuth.record import _compute_snapshot
@@ -205,6 +232,9 @@ def validate_split_plan(
         seen[url] = seen.get(url, 0) + 1
         if r.get("new_topic_id") not in valid_ids:
             problems.append(f"{url!r} is assigned to unknown sub-topic {r.get('new_topic_id')!r}")
+        ctype = r.get("new_connection_type")
+        if ctype is not None and ctype not in CONNECTION_TYPES:
+            problems.append(f"{url!r} has unknown connection type {ctype!r}")
     for url, n in seen.items():
         if n > 1:
             problems.append(f"{url!r} is assigned {n} times")

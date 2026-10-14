@@ -446,6 +446,8 @@ def cmd_tune(args):
         settings.synthesize.confirm_backend = args.confirm_backend
     if args.confirm_threshold is not None:
         settings.synthesize.confirm_link_threshold = args.confirm_threshold
+    if args.secondary_link_floor is not None:
+        settings.synthesize.secondary_link_floor = args.secondary_link_floor
     if args.ignore_tags:
         settings.candidates.ignored_tags = [
             t.strip() for t in args.ignore_tags.split(",") if t.strip()
@@ -591,6 +593,7 @@ def main():
     tune_parser.add_argument("--no-tag-overlap", action="store_true", help="Disable the tag-overlap candidate channel (vector search only)")
     tune_parser.add_argument("--confirm-backend", choices=["judge", "decision"], default=None, help="Which reviewer checks propose_new decisions (default: settings.yaml)")
     tune_parser.add_argument("--confirm-threshold", type=float, default=None, help="decision backend: p(belongs) needed to demote a proposal")
+    tune_parser.add_argument("--secondary-link-floor", type=float, default=None, help="Drop a second or later link scoring below this strength")
     tune_parser.add_argument("--no-confirm", action="store_true", help="Disable the second-pass confirmation of propose_new decisions")
     tune_parser.add_argument("--ignore-tags", type=str, default=None, help="Comma-separated tags excluded from overlap matching")
     tune_parser.set_defaults(func=cmd_tune)

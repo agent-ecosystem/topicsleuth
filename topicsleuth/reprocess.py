@@ -71,10 +71,13 @@ def execute_reprocess(store: Store, plan: ReprocessPlan) -> dict:
 
     for topic in plan.weak_topics:
         topic_id = topic["topic_id"]
-        deleted_obs += store.delete_observations_for_topic(topic_id)
+        # Topic first, then its observations: an insert that lands between
+        # the two finds the topic gone when it verifies its destination and
+        # removes itself, so nothing is stranded either way.
         if store.delete_topic(topic_id):
             deleted_topics += 1
             logger.info("Deleted weak topic: %s", topic_id)
+        deleted_obs += store.delete_observations_for_topic(topic_id)
 
     return {
         "topics_deleted": deleted_topics,

@@ -27,9 +27,10 @@ class DuplicateTopic(StoreError):
 
 
 class DuplicateObservation(StoreError):
-    """create_observation was given an (item_url, topic_id) pair the store
-    already holds. Recording treats this as "already recorded", which is
-    what makes a retried batch safe."""
+    """create_observation was given an (item_url, topic_id) the store already
+    holds. An item is evidence for a topic once; recording treats this as
+    "already recorded", which is what makes a retried batch and two feeders
+    admitting one document safe."""
 
 
 @dataclass
@@ -114,10 +115,12 @@ class Store(Protocol):
 
     Documents are plain dicts. ``topic_id`` identifies a topic and is
     unique: ``create_topic`` raises ``DuplicateTopic`` on a collision. An
-    observation is identified by ``(item_url, topic_id)`` and a store holds
-    at most one: ``create_observation`` raises ``DuplicateObservation`` on
-    a collision, atomically, so two writers cannot both insert the same
-    evidence. A store returns its own identifier for a created observation.
+    observation is identified by ``(item_url, topic_id)``: an item may be
+    evidence for several topics, once each. ``create_observation`` raises
+    ``DuplicateObservation`` on a collision, atomically, so two writers
+    cannot both insert the same evidence, and ``update_observation`` raises
+    it if an update would create that pair twice. A store returns its own
+    identifier for a created observation.
 
     Every datetime a store hands back is timezone-aware, in UTC. A store
     given a naive datetime treats it as UTC. The library does its date
@@ -168,6 +171,8 @@ class Store(Protocol):
     def list_observations(self) -> list[dict]: ...
 
     def update_observation(self, obs_id: Any, updates: dict) -> None: ...
+
+    def delete_observation(self, obs_id: Any) -> bool: ...
 
     def delete_observations_for_topic(self, topic_id: str) -> int: ...
 

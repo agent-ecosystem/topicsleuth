@@ -181,8 +181,8 @@ def test_tune_replays_a_prior_report(capsys, env):
     st.items["a0"] = {"url": "a0", "title": "A 0", "summary": "s", "embedding": E_A}
     (env / "prior.json").write_text(json.dumps({"decisions": [{"item_url": "a0"}]}))
     fake.shared("judge").queue({"candidate_classifications": [{"topic_id": "a", "label": "same_question"}], "decision": "link_existing",
-                                "topic_id": "a", "connection_type": "supports",
-                                "fit_questions": {"q1_scope_expansion": True, "q2_representative_citation": True, "q3_distinguishing_evidence": True},
+                                "links": [{"topic_id": "a", "connection_type": "supports",
+                                           "fit_questions": {"q1_scope_expansion": True, "q2_representative_citation": True, "q3_distinguishing_evidence": True}}],
                                 "reasoning_trace": "r"})
     code, out = run(capsys, "tune", "synthesize", "--replay", "prior.json", "--label", "t", "--limit", "3", "--model", "m2")
     assert code == 0 and "link_existing     1" in out and "report:" in out

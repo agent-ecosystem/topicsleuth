@@ -73,6 +73,24 @@ class SynthesizeConfig:
     #        if no decision model was supplied or a call fails.
     confirm_backend: str = "judge"
     confirm_link_threshold: float = 0.7
+    # A link decision may name several topics. The first link always
+    # stands; a second or later link whose derived strength is below this
+    # floor is dropped before recording, noted in the trace. 0 keeps every
+    # link the judge made.
+    secondary_link_floor: float = 0.0
+
+
+@dataclass
+class RecordConfig:
+    """Write-stage controls.
+
+    minor_floor_after: once a topic holds this many observations, a new
+        observation whose strength is below minor_floor_strength is still
+        filed but marked ``minor``, so a well-evidenced topic does not
+        drift on tangential links.
+    """
+    minor_floor_after: int = 20
+    minor_floor_strength: float = 0.7
 
 
 @dataclass
@@ -87,6 +105,7 @@ class Settings:
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     candidates: CandidateConfig = field(default_factory=CandidateConfig)
     synthesize: SynthesizeConfig = field(default_factory=SynthesizeConfig)
+    record: RecordConfig = field(default_factory=RecordConfig)
 
 
 def _deep_merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
@@ -146,6 +165,7 @@ def _from_raw(raw: dict[str, Any]) -> Settings:
         embedding=_section(EmbeddingConfig, raw, "embedding"),
         candidates=_section(CandidateConfig, raw, "candidates"),
         synthesize=_section(SynthesizeConfig, raw, "synthesize"),
+        record=_section(RecordConfig, raw, "record"),
     )
 
 

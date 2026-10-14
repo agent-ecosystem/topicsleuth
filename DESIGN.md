@@ -58,9 +58,11 @@ shipped for the same reason: a consumer's tests should not need a model.
 Settings are the decisions two feeders writing one store must agree on:
 the domain and the rubric prose the prompts are rendered with, the
 embedding dimensionality the index was built for, how candidates are
-assembled (vector limit, tag overlap, ignored routing tags), and the
+assembled (vector limit, tag overlap, ignored routing tags), the
 link-or-propose controls (whether proposals are reviewed, by which backend,
-at what threshold). They ship as packaged defaults and a feeder layers a
+at what threshold, and the floor under a document's secondary links), and
+the write-stage floor that marks weak observations on well-evidenced
+topics as minor. They ship as packaged defaults and a feeder layers a
 YAML file or a dict on top. The CLI reads that file from
 `TOPICSLEUTH_SETTINGS`.
 
@@ -110,23 +112,40 @@ Two feeders writing one store, and one feeder retrying after a failure,
 are the same problem: a write must mean the same thing however many times
 it lands. The rules the write path follows:
 
-- **Identity.** A topic is its `topic_id`; an observation is its
-  `(item_url, topic_id)`. Stores enforce both atomically (a unique index
-  in Mongo) and raise `DuplicateTopic` / `DuplicateObservation`, which
-  `record` treats as "already recorded": no second observation, no
-  failure, reported under `already_recorded`. A proposal whose id exists
-  with the same title is the same proposal landing twice and is reused; a
-  different title is a collision and the item fails. Synthesis picks a
-  slug no existing or batch topic uses, so collisions are rare.
-- **Failures are per item and write nothing.** A judge call that fails or
-  answers outside the contract, a proposal whose embedding fails, a topic
-  that cannot be created, a destination that no longer exists or is
-  retired, a store write that fails: each becomes an `ItemFailure` with a
-  stage, in `RecordResult.failures`, and nothing is written for that item,
-  including its embedding. `synthesize_items` carries failures as
-  decisions with `decision="failed"` so a batch is always fully accounted
-  for. A feeder acknowledges only the items outside `failed_urls()`; the
-  rest are retried, and idempotency makes the retry safe.
+- **Identity.** A topic is its `topic_id`. An observation is its
+  `(item_url, topic_id)`: an item may be evidence for several topics, once
+  each. A link decision carries every topic the judge rated `same_question`
+  (or, failing that, `subset_question`), each with its own fit answers,
+  strength and connection type, and `record` writes one observation per
+  link. Stores enforce both identities atomically (unique indexes in Mongo)
+  on insert and update, and raise `DuplicateTopic` / `DuplicateObservation`.
+  The stored observations are the durable decision for their item:
+  `synthesize_items` does not call the judge for an item the store holds,
+  and `record` reports it under `already_recorded` with the stored outcome
+  and applies none of this batch's links for it, so a retry cannot choose
+  different topics or open a second one, and two feeders deciding
+  differently about one document leave the first writer's observations.
+  The loser of that race removes the empty topic it opened. One
+  consequence: if a store write fails for one link after a sibling link
+  landed, the item is reported failed, but the retry sees the item as
+  recorded and does not add the missing link. Merges and moves fold an
+  item already on the target into the target's observation, noted in its
+  trace. A proposal whose id exists with the same title is reused; a
+  different title is a collision and the item fails. Synthesis picks a slug
+  no existing or batch topic uses.
+- **Failures are per item, and a retry finishes the work.** A judge call
+  that fails or answers outside the contract, a proposal whose embedding
+  fails, a topic that cannot be created, a destination that no longer
+  exists or is retired, a store write that fails at any stage (the
+  observation, the item embedding, the snapshot, the status): each becomes
+  an `ItemFailure` with its stage in `RecordResult.failures`.
+  `synthesize_items` carries failures as decisions with
+  `decision="failed"` so a batch is always fully accounted for. Nothing is
+  written before the observation for an item that fails earlier; a failure
+  after it leaves the observation in place, and the retry, finding it,
+  resumes what is missing (the snapshot if none was recorded since, the
+  status its snapshot implies, the embedding) rather than inserting again.
+  A feeder acknowledges only the items outside `failed_urls()`.
 - **The judge's answer is validated before it is written.** Decision and
   connection type must be known values, a link must name a shown
   candidate and carry the fit answers (or come from the gate or the
@@ -134,11 +153,26 @@ it lands. The rules the write path follows:
   classifications of topics the judge was not shown are dropped before
   the gate reads them. The write boundary re-checks that the destination
   exists and is not retired.
-- **History reads as history.** A snapshot counts only evidence dated at
+- **History reads as history.** Snapshots are event-time history, not a
+  record of what was known when. A snapshot counts only evidence dated at
   or before its date, snapshots are kept in date order by the store, and a
   batch dated before a topic's latest snapshot is inserted without
-  changing the topic's current status. Topics founded after the batch's
-  date are not status-checked by it.
+  changing the topic's current status; every later snapshot is then
+  recomputed as of its own date, keeping its `recorded_at` and `run_id`,
+  so the series and the latest count the judge is shown include the
+  backfill. Topics founded after the batch's date are not status-checked
+  by it.
+- **Ingestion and maintenance do not lock each other out.** Merge, split,
+  move, reprocess and clean may run while a feeder records. Recording
+  re-reads its destination after the insert: if the topic was merged
+  meanwhile the observation follows the merge, and if it was retired by a
+  split or deleted the observation is withdrawn and the item fails, to be
+  re-judged against the new topics next run. Reprocess deletes the topic
+  before its observations so an insert in the gap sees it gone. Merge and
+  split, after retiring their source, carry along anything that arrived on
+  it while they ran (split by nearest sub-topic embedding). The window is
+  one read and one write wide on either side, and both sides check, which
+  is cheaper than a lock and needs nothing from an adapter.
 - **Removal, not undo.** Every topic, observation and snapshot carries
   `recorded_at` (ingestion time, stamped by the store) and optionally the
   `run_id` the feeder passed. `delete_since` removes by those, keeps a

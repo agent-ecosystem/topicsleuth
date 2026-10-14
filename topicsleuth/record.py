@@ -11,7 +11,7 @@ from topicsleuth.embeddings import (
 from topicsleuth.interfaces import DuplicateObservation, DuplicateTopic, Embedder, ItemFailure, Store
 from topicsleuth.rubric import DEFAULT_CONNECTION_TYPE
 from topicsleuth.settings import Settings, load_settings
-from topicsleuth.synthesize import ItemEval, SynthesisDecision
+from topicsleuth.synthesize import ItemEval, Link, SynthesisDecision
 
 logger = logging.getLogger(__name__)
 
@@ -21,11 +21,6 @@ STATUS_THRESHOLDS = {
     "active_to_mature": 20,      # observations needed to become mature
     "fading_velocity": 0.1,      # velocity below this marks fading
     "dormant_days": 30,          # days without evidence marks dormant
-}
-
-# Strength floors for well-evidenced topics to prevent over-accumulation
-STRENGTH_FLOORS = {
-    20: 0.7,   # 20+ observations: require strength >= 0.7
 }
 
 
@@ -59,11 +54,12 @@ def _item_date(item: dict | None) -> datetime | None:
     return None
 
 
-def _strength_floor(evidence_count: int) -> float | None:
-    """Return the minimum strength required for a topic with this many observations."""
-    for threshold, floor in sorted(STRENGTH_FLOORS.items(), reverse=True):
-        if evidence_count >= threshold:
-            return floor
+def _strength_floor(evidence_count: int, settings: Settings) -> float | None:
+    """The strength below which a new observation on a topic with this many
+    observations is marked minor, or None while the topic is small
+    (settings.record)."""
+    if evidence_count >= settings.record.minor_floor_after:
+        return settings.record.minor_floor_strength
     return None
 
 
@@ -231,6 +227,51 @@ def record(
         if decision.decision == "failed":
             fail(decision.item_url, "synthesize", decision.error or "failed")
 
+    # Items the store already holds. The stored observation is the durable
+    # decision for that item (a retried batch, or a document another feeder
+    # admitted first); this batch's decision for it is not applied, and a
+    # proposal for it does not open a topic. What a failed earlier run left
+    # unfinished after the insert (snapshot, status, embedding) is resumed.
+    already: dict[str, list[dict]] = {}
+    for decision in decisions:
+        if decision.decision in ("skip", "failed"):
+            continue
+        existing = store.get_observations_for_item(decision.item_url)
+        if existing:
+            already[decision.item_url] = existing
+
+    # Topics whose status was re-checked from an existing snapshot while
+    # resuming; the quiet-topic pass leaves them alone.
+    resumed_status: set[str] = set()
+
+    def resume(stored: dict) -> None:
+        result.already_recorded.append(stored)
+        topic_id = stored.get("topic_id")
+        topic = store.get_topic(topic_id) if topic_id else None
+        if not topic:
+            return
+        snapshots = topic.get("snapshots") or []
+        stamps = [s.get("recorded_at") for s in snapshots if s.get("recorded_at")]
+        snapshotted = stored.get("recorded_at") and stamps and max(stamps) >= stored["recorded_at"]
+        if not snapshotted:
+            logger.info("Observation %s was recorded without a snapshot; finishing it", stored.get("item_url"))
+            prev_counts.setdefault(topic_id, store.count_observations_for_topic(topic_id) - 1)
+            affected_topics.add(topic_id)
+            d = stored.get("date") or now
+            if topic_id not in batch_dates or d > batch_dates[topic_id]:
+                batch_dates[topic_id] = d
+        elif topic_id not in affected_topics and topic_id not in resumed_status:
+            # Snapshotted, but the status change it implied may not have
+            # landed: apply the status the latest snapshot calls for.
+            resumed_status.add(topic_id)
+            transition = _detect_transition(topic, snapshots[-1])
+            if transition:
+                try:
+                    _apply_transition(store, result, transition)
+                except Exception as e:
+                    logger.error("Failed to update status of %s", topic_id, exc_info=True)
+                    fail(stored.get("item_url", ""), "status", e)
+
     def item_for(url: str) -> dict | None:
         return next((i for i in items if i["url"] == url), None)
 
@@ -241,7 +282,7 @@ def record(
 
     # 1. Create new topics from propose_new decisions
     for decision in decisions:
-        if decision.decision == "propose_new" and decision.new_topic:
+        if decision.decision == "propose_new" and decision.new_topic and decision.item_url not in already:
             founded = date_for(item_for(decision.item_url))
             topic_doc = {
                 "topic_id": decision.new_topic["topic_id"],
@@ -279,95 +320,31 @@ def record(
                 failed_topics.add(topic_doc["topic_id"])
                 fail(decision.item_url, "create_topic", e)
 
-    # 2. Create observations for link_existing and propose_new decisions
+    # 2. Create observations: one per link, or one on the proposed topic
     for decision in decisions:
         if decision.decision in ("skip", "failed"):
             continue
 
-        topic_id = decision.topic_id
+        if decision.item_url in already:
+            # The stored observations are the decision for this item; this
+            # batch's decision for it, whatever it says, is not applied.
+            for stored in already[decision.item_url]:
+                resume(stored)
+            continue
+
         if decision.decision == "propose_new" and decision.new_topic:
-            topic_id = decision.new_topic["topic_id"]
+            links = [Link(topic_id=decision.new_topic["topic_id"], connection_type=DEFAULT_CONNECTION_TYPE,
+                          strength=decision.strength if decision.strength is not None else 0.7)]
+        else:
+            links = list(decision.links)
 
-        if not topic_id:
-            continue
-
-        # The destination must exist at the moment of writing: a proposal
-        # that failed to create, a batch-mate's proposal that failed, or a
-        # topic retired by a concurrent merge are all failures, not orphans.
-        if topic_id in failed_topics:
-            if decision.decision == "link_existing":
-                fail(decision.item_url, "create_topic", f"linked to proposal {topic_id!r}, which was not created")
-            continue
-        destination = store.get_topic(topic_id)
-        if destination is None:
-            fail(decision.item_url, "create_observation", f"topic {topic_id!r} does not exist")
-            continue
-        if destination.get("status") == "retired":
-            fail(decision.item_url, "create_observation", f"topic {topic_id!r} is retired")
-            continue
-
-        evidence_count = store.count_observations_for_topic(topic_id)
-        prev_counts.setdefault(topic_id, evidence_count)
-
-        # Flag weak observations for well-evidenced topics as minor
-        is_minor = False
-        if decision.decision == "link_existing":
-            strength = decision.strength if decision.strength is not None else 0.7
-            required = _strength_floor(evidence_count)
-            if required and strength < required:
-                is_minor = True
-                logger.info(
-                    "Marking minor observation (%.2f < %.2f floor) for "
-                    "well-evidenced topic %s (%d obs): %s",
-                    strength, required, topic_id, evidence_count,
-                    decision.item_title[:50],
-                )
-
-        # Look up source info from the item
         item = item_for(decision.item_url)
         obs_date = date_for(item)
-
-        obs_doc = {
-            "item_id": item["_id"] if item and "_id" in item else None,
-            "item_url": decision.item_url,
-            "item_title": decision.item_title,
-            "topic_id": topic_id,
-            "date": obs_date,
-            "strength": decision.strength if decision.strength is not None else 0.7,
-            "connection_type": decision.connection_type or DEFAULT_CONNECTION_TYPE,
-            "reasoning_trace": decision.reasoning_trace,
-            "source_name": item.get("source_name", "") if item else "",
-            "source_type": item.get("source_type", "") if item else "",
-            # Copied from the item so a topic's lane mix and evidence mix
-            # over time are computable without joining back to items.
-            "tags": list(item.get("tags") or []) if item else [],
-            "evidence": item.get("evidence") if item else None,
-            "lanes": item.get("lanes") if item else None,
-            "entities_mentioned": [],
-            "minor": is_minor,
-        }
-        if backfill:
-            obs_doc["backfill"] = True
-        if run_id:
-            obs_doc["run_id"] = run_id
-
-        try:
-            store.create_observation(obs_doc)
-        except DuplicateObservation:
-            # Already recorded: a retried batch, or another feeder got here
-            # first. The evidence is in the store once, which is the point.
-            logger.info("Observation already recorded: %s -> %s", decision.item_url, topic_id)
-            result.already_recorded.append(obs_doc)
-            continue
-        except Exception as e:
-            logger.error("Failed to create observation for %s", decision.item_url, exc_info=True)
-            fail(decision.item_url, "create_observation", e)
-            continue
-        result.observations_created.append(obs_doc)
-        affected_topics.add(topic_id)
-        if topic_id not in batch_dates or obs_date > batch_dates[topic_id]:
-            batch_dates[topic_id] = obs_date
-        logger.info("Created observation: %s -> %s", decision.item_title[:40], topic_id)
+        for link in links:
+            _record_link(
+                store, result, decision, link, item, obs_date, now, backfill, run_id,
+                failed_topics, prev_counts, affected_topics, batch_dates, resume, fail, settings,
+            )
 
     # 3. Save embeddings on item documents (only for items that got this far)
     failed = result.failed_urls()
@@ -387,20 +364,32 @@ def record(
         if not topic:
             continue
 
+        urls_here = [o["item_url"] for o in result.observations_created + result.already_recorded
+                     if o.get("topic_id") == topic_id]
+
         as_of = batch_dates.get(topic_id, now)
         snapshot = _compute_snapshot(store, topic_id, as_of)
         if run_id:
             snapshot["run_id"] = run_id
-        store.append_snapshot(topic_id, snapshot)
+        try:
+            store.append_snapshot(topic_id, snapshot)
+        except Exception as e:
+            logger.error("Failed to snapshot topic %s", topic_id, exc_info=True)
+            for url in urls_here:
+                fail(url, "snapshot", e)
+            continue
         result.topics_updated.append(topic_id)
 
         # A batch dated before the topic's latest snapshot is history being
-        # filled in: it gets its snapshot, but the topic's current status
-        # was set by newer evidence and stays.
+        # filled in: it gets its snapshot, every later snapshot is recomputed
+        # to include it, and the topic's current status, set by newer
+        # evidence, stays.
         latest_snapshot = max(
             (s["date"] for s in topic.get("snapshots") or [] if s.get("date")), default=None,
         )
         is_history = latest_snapshot is not None and as_of < latest_snapshot
+        if is_history:
+            _rebuild_later_snapshots(store, topic_id, as_of)
 
         if date_from_item:
             # Vector search does not filter candidates by date, so an old
@@ -432,7 +421,12 @@ def record(
 
         transition = None if is_history else _detect_transition(topic, snapshot)
         if transition:
-            _apply_transition(store, result, transition)
+            try:
+                _apply_transition(store, result, transition)
+            except Exception as e:
+                logger.error("Failed to update status of %s", topic_id, exc_info=True)
+                for url in urls_here:
+                    fail(url, "status", e)
 
     # 5. Status check on the quiet topics. A topic that received nothing
     #    this run can only fade or go dormant, and nothing else would ever
@@ -444,7 +438,7 @@ def record(
     if as_of is not None:
         for topic in store.list_topics(include_retired=False):
             topic_id = topic["topic_id"]
-            if topic_id in affected_topics:
+            if topic_id in affected_topics or topic_id in resumed_status:
                 continue
             identified = topic.get("date_identified")
             if identified and identified > as_of:
@@ -466,6 +460,25 @@ def record(
     return result
 
 
+def _rebuild_later_snapshots(store: Store, topic_id: str, after: datetime) -> None:
+    """Snapshots are event-time history: when evidence is inserted before
+    them, every later snapshot is recomputed as of its own date so the
+    series, and the latest count the judge is shown, include it. Each keeps
+    its recorded_at and run_id."""
+    topic = store.get_topic(topic_id)
+    if not topic:
+        return
+    measured = ("evidence_count", "source_diversity", "source_type_diversity",
+                "velocity", "recency_weight", "days_since_evidence")
+    rebuilt = []
+    for s in topic.get("snapshots") or []:
+        if s.get("date") and s["date"] > after:
+            fresh = _compute_snapshot(store, topic_id, s["date"])
+            s = {**s, **{k: fresh[k] for k in measured}}
+        rebuilt.append(s)
+    store.update_topic(topic_id, {"snapshots": rebuilt})
+
+
 def _apply_transition(store: Store, result: RecordResult, transition: dict) -> None:
     store.update_topic(transition["topic_id"], {"status": transition["to_status"]})
     result.transitions.append(transition)
@@ -475,3 +488,141 @@ def _apply_transition(store: Store, result: RecordResult, transition: dict) -> N
         transition["from_status"],
         transition["to_status"],
     )
+
+
+def _record_link(store, result, decision, link, item, obs_date, now, backfill, run_id,
+                 failed_topics, prev_counts, affected_topics, batch_dates, resume, fail, settings) -> None:
+    """Write one observation: the item as evidence for one topic."""
+    topic_id = link.topic_id
+    if not topic_id:
+        return
+
+    # The destination must exist at the moment of writing: a proposal that
+    # failed to create, a batch-mate's proposal that failed, or a topic
+    # retired by a concurrent merge are all failures, not orphans.
+    if topic_id in failed_topics:
+        if decision.decision == "link_existing":
+            fail(decision.item_url, "create_topic", f"linked to proposal {topic_id!r}, which was not created")
+        return
+    destination = store.get_topic(topic_id)
+    if destination is None:
+        fail(decision.item_url, "create_observation", f"topic {topic_id!r} does not exist")
+        return
+    if destination.get("status") == "retired":
+        fail(decision.item_url, "create_observation", f"topic {topic_id!r} is retired")
+        return
+
+    evidence_count = store.count_observations_for_topic(topic_id)
+    prev_counts.setdefault(topic_id, evidence_count)
+
+    # Flag weak observations for well-evidenced topics as minor
+    strength = link.strength if link.strength is not None else 0.7
+    is_minor = False
+    if decision.decision == "link_existing":
+        required = _strength_floor(evidence_count, settings)
+        if required and strength < required:
+            is_minor = True
+            logger.info(
+                "Marking minor observation (%.2f < %.2f floor) for "
+                "well-evidenced topic %s (%d obs): %s",
+                strength, required, topic_id, evidence_count,
+                decision.item_title[:50],
+            )
+
+    obs_doc = {
+        "item_id": item["_id"] if item and "_id" in item else None,
+        "item_url": decision.item_url,
+        "item_title": decision.item_title,
+        "topic_id": topic_id,
+        "date": obs_date,
+        "strength": strength,
+        "connection_type": link.connection_type or DEFAULT_CONNECTION_TYPE,
+        "fit_questions": link.fit_questions,
+        "reasoning_trace": decision.reasoning_trace,
+        "source_name": item.get("source_name", "") if item else "",
+        "source_type": item.get("source_type", "") if item else "",
+        # Copied from the item so a topic's lane mix and evidence mix
+        # over time are computable without joining back to items.
+        "tags": list(item.get("tags") or []) if item else [],
+        "evidence": item.get("evidence") if item else None,
+        "lanes": item.get("lanes") if item else None,
+        "entities_mentioned": [],
+        "minor": is_minor,
+    }
+    if backfill:
+        obs_doc["backfill"] = True
+    if run_id:
+        obs_doc["run_id"] = run_id
+
+    try:
+        obs_id = store.create_observation(obs_doc)
+    except DuplicateObservation:
+        # Another feeder got here between our read and our write. The
+        # evidence is in the store once, which is the point; if we had
+        # opened a topic for this item, it is empty and goes.
+        logger.info("Observation already recorded by another writer: %s on %s", decision.item_url, topic_id)
+        stored = [o for o in store.get_observations_for_item(decision.item_url) if o.get("topic_id") == topic_id]
+        resume(stored[0] if stored else obs_doc)
+        ours = {t["topic_id"]: t for t in result.topics_created}
+        if decision.decision == "propose_new" and topic_id in ours and store.count_observations_for_topic(topic_id) == 0:
+            store.delete_topic(topic_id)
+            result.topics_created.remove(ours[topic_id])
+            logger.info("Removed empty topic %s opened for an item another writer recorded", topic_id)
+        return
+    except Exception as e:
+        logger.error("Failed to create observation for %s", decision.item_url, exc_info=True)
+        fail(decision.item_url, "create_observation", e)
+        return
+
+    # Verify the destination after the write. Maintenance (merge, split,
+    # reprocess, clean) can retire or delete a topic between the check
+    # above and the insert; the observation then follows a merge, or is
+    # withdrawn and the item fails, so nothing is stranded.
+    landed = store.get_topic(topic_id)
+    if landed is None or landed.get("status") == "retired":
+        target = (landed or {}).get("merged_into")
+        target_topic = store.get_topic(target) if target else None
+        if target_topic and target_topic.get("status") != "retired":
+            try:
+                store.update_observation(obs_id, {
+                    "topic_id": target, "moved_from": topic_id,
+                    "reasoning_trace": obs_doc["reasoning_trace"]
+                    + f"\n\nMOVED by record on {now.date().isoformat()}: '{topic_id}' was merged into '{target}' during the write.",
+                })
+            except DuplicateObservation:
+                # The item was already evidence on the merge target.
+                store.delete_observation(obs_id)
+                stored = [o for o in store.get_observations_for_item(decision.item_url) if o.get("topic_id") == target]
+                if stored:
+                    resume(stored[0])
+                return
+            logger.warning("Topic %s was merged during the write; observation for %s moved to %s", topic_id, decision.item_url, target)
+            obs_doc = {**obs_doc, "topic_id": target, "moved_from": topic_id}
+            topic_id = target
+            prev_counts.setdefault(topic_id, store.count_observations_for_topic(topic_id) - 1)
+        else:
+            store.delete_observation(obs_id)
+            what = "deleted" if landed is None else "retired"
+            fail(decision.item_url, "create_observation", f"topic {topic_id!r} was {what} during the write")
+            return
+    if decision.decision == "propose_new":
+        # A proposal is a claim that no topic fits. If another writer
+        # recorded this item on some topic between our pre-check and our
+        # insert, that claim is contested: withdraw, drop the empty topic,
+        # and fail the item so the next run sees their decision and resumes.
+        others = [o for o in store.get_observations_for_item(decision.item_url) if o.get("topic_id") != topic_id]
+        if others:
+            store.delete_observation(obs_id)
+            ours = {t["topic_id"]: t for t in result.topics_created}
+            if topic_id in ours and store.count_observations_for_topic(topic_id) == 0:
+                store.delete_topic(topic_id)
+                result.topics_created.remove(ours[topic_id])
+            elsewhere = sorted(o["topic_id"] for o in others)
+            fail(decision.item_url, "create_observation",
+                 f"another writer recorded this item on {elsewhere} during the write; proposal withdrawn")
+            return
+    result.observations_created.append(obs_doc)
+    affected_topics.add(topic_id)
+    if topic_id not in batch_dates or obs_date > batch_dates[topic_id]:
+        batch_dates[topic_id] = obs_date
+    logger.info("Created observation: %s -> %s", decision.item_title[:40], topic_id)

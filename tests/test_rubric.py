@@ -49,7 +49,8 @@ def test_decision_prompts_carry_every_label_question_and_type(name):
     for ctype, meaning in CONNECTION_TYPES.items():
         assert f"`{ctype}`: {meaning}" in text
     assert '"label": ' + " | ".join(f'"{l}"' for l in RELATIONSHIP_LABELS) in text
-    assert '"connection_type": ' + " | ".join(f'"{c}"' for c in CONNECTION_TYPES) + " | null" in text
+    assert '"connection_type": ' + " | ".join(f'"{c}"' for c in CONNECTION_TYPES) + ",\n" in text
+    assert '"links": [' in text and "one entry per topic the item is evidence for" in text
 
 
 def test_the_two_decision_prompts_share_their_steps_verbatim():

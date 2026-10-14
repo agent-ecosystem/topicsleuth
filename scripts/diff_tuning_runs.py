@@ -3,6 +3,7 @@ import json, sys
 from collections import Counter
 a = json.load(open(sys.argv[1])); b = json.load(open(sys.argv[2]))
 def tid(d): return d.get("topic_id", d.get("theme_id"))  # reports before the rename say theme_id
+def tids(d): return sorted(l["topic_id"] for l in d.get("links") or []) or ([tid(d)] if tid(d) else [])
 def new_tid(d): return tid(d.get("new_topic") or d.get("new_theme") or {})
 def hdr(r): return f"{r.get('label') or r['run_at'][:10]} model={r['config']['model']} topics={r.get('topic_universe', r.get('theme_universe', '?'))} tag_overlap={r['config'].get('candidates',{}).get('tag_overlap','?')}"
 print("A:", hdr(a)); print("B:", hdr(b))
@@ -17,7 +18,7 @@ if common:
     print()
     for u in common:
         x, y = da[u], db[u]
-        if x["decision"] != y["decision"] or (x["decision"]=="link_existing" and tid(x)!=tid(y)):
-            tx = tid(x) or new_tid(x) or "-"
-            ty = tid(y) or new_tid(y) or "-"
+        if x["decision"] != y["decision"] or (x["decision"]=="link_existing" and tids(x)!=tids(y)):
+            tx = "+".join(tids(x)) or new_tid(x) or "-"
+            ty = "+".join(tids(y)) or new_tid(y) or "-"
             print(f"  {x['item_title'][:55]:<55} | {x['decision']:>13}:{tx[:30]:<30} -> {y['decision']:>13}:{ty[:30]}")

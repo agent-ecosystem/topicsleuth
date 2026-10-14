@@ -211,7 +211,7 @@ class TestEnforceLinkGate:
         ]
         result = _enforce_link_gate(parsed, candidates)
         assert result["decision"] == "link_existing"
-        assert result["topic_id"] == "memory-arch"
+        assert [l["topic_id"] for l in result["links"]] == ["memory-arch"]
         assert result["new_topic"] is None
         assert result["gate_override"] is True
         assert "GATE OVERRIDE" in result["reasoning_trace"]
@@ -230,7 +230,7 @@ class TestEnforceLinkGate:
         ]
         result = _enforce_link_gate(parsed, candidates)
         assert result["decision"] == "link_existing"
-        assert result["topic_id"] == "exact"
+        assert [l["topic_id"] for l in result["links"]] == ["exact"]
 
     def test_prefers_same_question_over_subset(self):
         # When both labels are present, same_question wins regardless of
@@ -249,10 +249,10 @@ class TestEnforceLinkGate:
             {"topic_id": "same-with-few", "snapshots": [{"evidence_count": 2}]},
         ]
         result = _enforce_link_gate(parsed, candidates)
-        assert result["topic_id"] == "same-with-few"
+        assert [l["topic_id"] for l in result["links"]] == ["same-with-few"], "subset matches are not linked when a same_question exists"
 
-    def test_picks_higher_evidence_within_same_label(self):
-        # With multiple subset matches, choose the most-evidenced one.
+    def test_links_every_match_within_the_label_most_evidence_first(self):
+        # With multiple subset matches, the item is evidence for each.
         parsed = {
             "decision": "propose_new",
             "reasoning_trace": "",
@@ -267,7 +267,8 @@ class TestEnforceLinkGate:
             {"topic_id": "large", "snapshots": [{"evidence_count": 30}]},
         ]
         result = _enforce_link_gate(parsed, candidates)
-        assert result["topic_id"] == "large"
+        assert [l["topic_id"] for l in result["links"]] == ["large", "small"]
+        assert all(l["strength"] == GATE_OVERRIDE_DEFAULT_STRENGTH for l in result["links"])
 
     def test_no_override_when_only_adjacent_or_surface(self):
         parsed = {
@@ -296,7 +297,7 @@ class TestEnforceLinkGate:
     def test_no_override_for_link_existing(self):
         parsed = {
             "decision": "link_existing",
-            "topic_id": "foo",
+            "links": [{"topic_id": "foo", "connection_type": "supports", "fit_questions": None, "strength": 0.8}],
             "reasoning_trace": "good link",
             "candidate_classifications": [
                 {"topic_id": "foo", "label": "same_question"}
@@ -305,7 +306,7 @@ class TestEnforceLinkGate:
         }
         result = _enforce_link_gate(parsed, [])
         assert result["decision"] == "link_existing"
-        assert result["topic_id"] == "foo"
+        assert result["links"][0]["topic_id"] == "foo"
         assert not result.get("gate_override")
 
     def test_no_override_for_skip(self):
@@ -329,7 +330,7 @@ class TestEnforceLinkGate:
         candidates = [{"topic_id": "foo", "snapshots": [{"evidence_count": 5}]}]
         result = _enforce_link_gate(parsed, candidates)
         assert result["strength"] == GATE_OVERRIDE_DEFAULT_STRENGTH
-        assert result["connection_type"] == "supports"
+        assert result["links"][0]["connection_type"] == "supports"
 
     def test_skips_invalid_classification_entries(self):
         # Defensive: classifications list might contain non-dict entries.
@@ -345,7 +346,7 @@ class TestEnforceLinkGate:
         candidates = [{"topic_id": "valid", "snapshots": [{"evidence_count": 4}]}]
         result = _enforce_link_gate(parsed, candidates)
         assert result["decision"] == "link_existing"
-        assert result["topic_id"] == "valid"
+        assert result["links"][0]["topic_id"] == "valid"
 
 
 class TestParseDecisionEndToEnd:
@@ -358,20 +359,20 @@ class TestParseDecisionEndToEnd:
                  "candidate_question": "Q1", "item_question": "Q2"}
             ],
             "decision": "link_existing",
-            "topic_id": "a",
-            "connection_type": "supports",
-            "fit_questions": {
-                "q1_scope_expansion": False,
-                "q2_representative_citation": True,
-                "q3_distinguishing_evidence": True,
-            },
+            "links": [
+                {"topic_id": "a", "connection_type": "supports",
+                 "fit_questions": {"q1_scope_expansion": False, "q2_representative_citation": True, "q3_distinguishing_evidence": True}},
+                {"topic_id": "B Two", "connection_type": "extends",
+                 "fit_questions": {"q1_scope_expansion": True, "q2_representative_citation": True, "q3_distinguishing_evidence": True}},
+            ],
             "reasoning_trace": "base trace",
         })
         out = _parse_decision(raw)
         assert out["decision"] == "link_existing"
-        assert out["strength"] == 0.80
+        assert [(l["topic_id"], l["strength"]) for l in out["links"]] == [("a", 0.80), ("b-two", 0.95)], "scored per link, ids sanitized"
+        assert out["strength"] == 0.80, "the first link's, for readers that want one number"
         assert "Candidate classifications:" in out["reasoning_trace"]
-        assert "Fit questions:" in out["reasoning_trace"]
+        assert "Fit questions for a:" in out["reasoning_trace"] and "Fit questions for b-two:" in out["reasoning_trace"]
         assert "derived_strength: 0.8" in out["reasoning_trace"]
 
     def test_propose_new_uses_default_strength(self):
@@ -413,26 +414,20 @@ class TestParseDecisionEndToEnd:
         out = _parse_decision(raw)
         assert out["new_topic"]["topic_id"] == "foo-bar-baz"
 
-    def test_sanitizes_top_level_topic_id(self):
+    def test_link_without_fit_questions_has_no_strength(self):
+        # The parser leaves it unscored; validation then fails the item.
         raw = json.dumps({
             "decision": "link_existing",
-            "topic_id": "Foo Bar",
+            "links": [{"topic_id": "Foo Bar", "connection_type": "supports"}],
             "reasoning_trace": "",
         })
         out = _parse_decision(raw)
-        assert out["topic_id"] == "foo-bar"
-
-    def test_link_existing_without_fit_questions_falls_back_to_zero(self):
-        # Defensive: if the model emits link_existing without fit_questions,
-        # strength stays 0.0 (signal that something went wrong).
-        raw = json.dumps({
-            "decision": "link_existing",
-            "topic_id": "foo",
-            "connection_type": "supports",
-            "reasoning_trace": "",
-        })
-        out = _parse_decision(raw)
+        assert out["links"] == [{"topic_id": "foo-bar", "connection_type": "supports", "fit_questions": None, "strength": None}]
         assert out["strength"] == 0.0
+
+    def test_link_without_a_links_list_is_an_empty_link_decision(self):
+        out = _parse_decision(json.dumps({"decision": "link_existing", "topic_id": "a", "reasoning_trace": ""}))
+        assert out["links"] == [] and "topic_id" not in out.get("links", [{}])[0:0]
 
 
 from topicsleuth.synthesize import (  # noqa: E402
@@ -475,8 +470,7 @@ class TestApplyConfirmation:
         }
         out = _apply_confirmation(_proposal(), confirm, {"a"})
         assert out["decision"] == "link_existing"
-        assert out["topic_id"] == "a"
-        assert out["connection_type"] == "extends"
+        assert out["links"] == [{"topic_id": "a", "connection_type": "extends", "fit_questions": None, "strength": CONFIRM_LINK_STRENGTH}]
         assert out["strength"] == CONFIRM_LINK_STRENGTH
         assert out["new_topic"] is None
         assert out["confirmation"] == "overridden_to_link"
@@ -495,12 +489,12 @@ class TestApplyConfirmation:
         }
         out = _apply_confirmation(_proposal(), confirm, {"a"})
         assert out["strength"] == CONFIRM_LINK_STRENGTH
-        assert out["fit_questions"] is None
-        assert out["connection_type"] == "extends"
+        assert out["links"][0]["fit_questions"] is None
+        assert out["links"][0]["connection_type"] == "extends"
 
     def test_link_strength_sits_between_minor_floor_and_core_evidence(self):
-        from topicsleuth.record import STRENGTH_FLOORS
-        assert CONFIRM_LINK_STRENGTH >= max(STRENGTH_FLOORS.values())
+        from topicsleuth.settings import RecordConfig
+        assert CONFIRM_LINK_STRENGTH >= RecordConfig().minor_floor_strength
         assert CONFIRM_LINK_STRENGTH < 0.80
 
     def test_link_to_unshown_topic_is_ignored(self):
@@ -515,12 +509,12 @@ class TestApplyConfirmation:
         out = _apply_confirmation(
             _proposal(), {"verdict": "link_existing", "topic_id": "A"}, {"a"}
         )
-        assert out["decision"] == "link_existing" and out["topic_id"] == "a"
+        assert out["decision"] == "link_existing" and out["links"][0]["topic_id"] == "a"
 
     def test_skip_clears_topic_fields(self):
         out = _apply_confirmation(_proposal(), {"verdict": "skip", "closest_candidate": "a"}, {"a"})
         assert out["decision"] == "skip"
-        assert out["topic_id"] is None and out["new_topic"] is None
+        assert out["links"] == [] and out["new_topic"] is None
         assert out["strength"] == 0.0
         assert out["confirmation"] == "overridden_to_skip"
 
@@ -557,8 +551,8 @@ class TestApplyDecisionConfirmation:
             {"topic_id": "b", "link_probability": 0.81, "label": "subset_question", "confidence": 0.7},
         ]
         out = _apply_decision_confirmation(_proposal(), scores, 0.7)
-        assert out["decision"] == "link_existing" and out["topic_id"] == "b"
-        assert out["connection_type"] == "extends"
+        assert out["decision"] == "link_existing" and out["links"][0]["topic_id"] == "b"
+        assert out["links"][0]["connection_type"] == "extends"
         assert out["strength"] == CONFIRM_LINK_STRENGTH
         assert out["new_topic"] is None
         assert out["confirmation"] == "overridden_to_link"

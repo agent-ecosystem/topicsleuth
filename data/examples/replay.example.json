@@ -102,6 +102,9 @@
    "topic_id": "solar-panel-recycling-recovery-yields",
    "connection_type": "supports",
    "strength": 0.95,
+   "links": [
+    {"topic_id": "solar-panel-recycling-recovery-yields", "connection_type": "supports", "strength": 0.95}
+   ],
    "reasoning_trace": "Same question: the item reports the yields the topic tracks.",
    "diagnostics": {
     "confirmation": null,
@@ -145,6 +148,7 @@
    "decision": "propose_new",
    "topic_id": null,
    "connection_type": null,
+   "links": [],
    "strength": null,
    "reasoning_trace": "No candidate tracks collection policy; the question is right-sized.",
    "new_topic": {

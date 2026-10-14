@@ -87,6 +87,7 @@ def _decision_to_dict(d: SynthesisDecision, item: dict) -> dict[str, Any]:
         "topic_id": d.topic_id,
         "connection_type": d.connection_type,
         "strength": d.strength,
+        "links": [{"topic_id": l.topic_id, "connection_type": l.connection_type, "strength": l.strength} for l in d.links],
         "reasoning_trace": d.reasoning_trace,
     }
     if d.new_topic:
@@ -150,7 +151,10 @@ def _summarize(decisions: list[dict]) -> dict[str, Any]:
     counts = Counter(d["decision"] for d in decisions)
     total = len(decisions) or 1
 
-    strengths = [d["strength"] or 0 for d in decisions if d["decision"] == "link_existing"]
+    # Every link counts: a decision may put the item on more than one topic.
+    all_links = [l for d in decisions if d["decision"] == "link_existing" for l in d["links"]]
+    link_decisions = sum(1 for d in decisions if d["decision"] == "link_existing")
+    strengths = [l["strength"] or 0 for l in all_links]
     strength_buckets = {
         "<0.3": 0, "0.3-0.5": 0, "0.5-0.7": 0,
         "0.7-0.8": 0, "0.8-0.9": 0, "0.9+": 0,
@@ -163,10 +167,20 @@ def _summarize(decisions: list[dict]) -> dict[str, Any]:
         elif s < 0.9: strength_buckets["0.8-0.9"] += 1
         else: strength_buckets["0.9+"] += 1
 
-    connection_types = Counter(
-        d["connection_type"] for d in decisions
-        if d["decision"] == "link_existing" and d["connection_type"]
-    )
+    connection_types = Counter(l["connection_type"] for l in all_links if l["connection_type"])
+    secondary = [l for d in decisions if d["decision"] == "link_existing" for l in d["links"][1:]]
+    secondary_buckets = Counter()
+    for l in secondary:
+        s = l["strength"] or 0
+        secondary_buckets["<0.5" if s < 0.5 else "0.5-0.7" if s < 0.7 else "0.7-0.9" if s < 0.9 else "0.9+"] += 1
+    links = {
+        "total": len(all_links),
+        "per_link_decision": round(len(all_links) / link_decisions, 3) if link_decisions else None,
+        "multi_link_decisions": sum(1 for d in decisions if d["decision"] == "link_existing" and len(d["links"]) > 1),
+        "secondary": len(secondary),
+        "secondary_strength_buckets": dict(secondary_buckets),
+        "dropped_by_floor": sum(len((d.get("diagnostics") or {}).get("dropped_links") or []) for d in decisions),
+    }
 
     new_topics = [
         {
@@ -180,10 +194,7 @@ def _summarize(decisions: list[dict]) -> dict[str, Any]:
         if d["decision"] == "propose_new" and d.get("new_topic")
     ]
 
-    link_targets = Counter(
-        d["topic_id"] for d in decisions
-        if d["decision"] == "link_existing" and d["topic_id"]
-    )
+    link_targets = Counter(l["topic_id"] for l in all_links if l["topic_id"])
 
     return {
         "total": total,
@@ -198,6 +209,7 @@ def _summarize(decisions: list[dict]) -> dict[str, Any]:
         },
         "strength_buckets": strength_buckets,
         "connection_types": dict(connection_types),
+        "links": links,
         "new_topics": new_topics,
         "link_targets": dict(link_targets.most_common()),
         "diagnostics": _summarize_diagnostics(decisions),
@@ -327,6 +339,11 @@ def replay_synthesis(
                 "confirm_candidates": settings.synthesize.confirm_candidates,
                 "confirm_backend": settings.synthesize.confirm_backend,
                 "confirm_link_threshold": settings.synthesize.confirm_link_threshold,
+                "secondary_link_floor": settings.synthesize.secondary_link_floor,
+            },
+            "record": {
+                "minor_floor_after": settings.record.minor_floor_after,
+                "minor_floor_strength": settings.record.minor_floor_strength,
             },
         },
         "summary": summary,
@@ -370,6 +387,12 @@ def _print_summary(summary: dict[str, Any], output_path: Path) -> None:
     print("CONNECTION TYPES")
     for k, v in summary["connection_types"].items():
         print(f"  {k:<14} {v}")
+    links = summary["links"]
+    print()
+    print(f"LINKS  total={links['total']}  per link decision={links['per_link_decision']}  "
+          f"decisions with more than one={links['multi_link_decisions']}")
+    print(f"  secondary links {links['secondary']}  strengths {links['secondary_strength_buckets']}  "
+          f"dropped by floor {links['dropped_by_floor']}")
 
     if summary["new_topics"]:
         print()

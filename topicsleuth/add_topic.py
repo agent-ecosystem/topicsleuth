@@ -144,7 +144,26 @@ def move_observations(
     sources: set[str] = set()
     for o in observations:
         src = o["topic_id"]
+        if src == target_topic_id:
+            continue
         sources.add(src)
+        # An item may already be evidence on the target (it bore on both
+        # questions). One observation per item per topic: the target's
+        # survives and the moving one is folded into it, noted in the trace.
+        holder = next((h for h in store.get_observations_for_item(o["item_url"])
+                       if h.get("topic_id") == target_topic_id), None)
+        if holder is not None:
+            note = (
+                f"\n\nFOLDED by {reason} on {now.date().isoformat()}: this item's "
+                f"observation on '{src}' (strength {o.get('strength')}, {o.get('connection_type')}) "
+                f"was merged into this one."
+            )
+            store.update_observation(holder["_id"], {
+                "reasoning_trace": (holder.get("reasoning_trace") or "") + note,
+            })
+            store.delete_observation(o["_id"])
+            logger.info("Folded duplicate observation of %s from %s into %s", o["item_url"], src, target_topic_id)
+            continue
         note = (
             f"\n\nMOVED by {reason} on {now.date().isoformat()}: from "
             f"'{src}' to '{target_topic_id}'."

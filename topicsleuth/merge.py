@@ -206,13 +206,23 @@ def merge_topics(
     })
     logger.info("Retired source topic: %s", source_topic_id)
 
+    # Anything a concurrent run recorded on the source since it was read
+    # follows the merge (record itself re-homes an insert that lands after
+    # the retirement; this covers one that landed before it).
+    late = store.get_observations_for_topic(source_topic_id)
+    if late:
+        logger.warning("%d observation(s) arrived on %s during the merge; moving them to %s",
+                       len(late), source_topic_id, target_topic_id)
+        move_observations(store, late, target_topic_id, now, reason="merge, arrived during it",
+                          retire_empty_sources=False)
+
     return {
         "dry_run": False,
         "source_topic_id": source_topic_id,
         "target_topic_id": target_topic_id,
         "merged_title": new_title,
         "merged_summary": new_summary,
-        "observations_reassigned": len(source_obs),
+        "observations_reassigned": len(source_obs) + len(late),
         "target_observation_count_after": len(source_obs) + len(target_obs),
     }
 

@@ -117,10 +117,13 @@ class MemoryStore:
         return weak
 
     # ── observations ──
+    def _holder(self, item_url, topic_id, except_id=None):
+        return next((k for k, o in self.observations.items()
+                     if k != except_id and o.get("item_url") == item_url and o.get("topic_id") == topic_id), None)
+
     def create_observation(self, obs_doc: dict) -> Any:
-        key = (obs_doc.get("item_url"), obs_doc.get("topic_id"))
-        if any((o.get("item_url"), o.get("topic_id")) == key for o in self.observations.values()):
-            raise DuplicateObservation(f"observation exists for {key[0]} on {key[1]}")
+        if self._holder(obs_doc.get("item_url"), obs_doc.get("topic_id")) is not None:
+            raise DuplicateObservation(f"observation exists for {obs_doc.get('item_url')} on {obs_doc.get('topic_id')}")
         oid = next(self._ids)
         doc = _aware(dict(obs_doc))
         doc.setdefault("date", datetime.now(timezone.utc))
@@ -142,7 +145,15 @@ class MemoryStore:
         return [copy.deepcopy(o) for o in self.observations.values()]
 
     def update_observation(self, obs_id: Any, updates: dict) -> None:
-        self.observations[obs_id].update(_aware(updates))
+        current = self.observations[obs_id]
+        url = updates.get("item_url", current.get("item_url"))
+        topic_id = updates.get("topic_id", current.get("topic_id"))
+        if ("item_url" in updates or "topic_id" in updates) and self._holder(url, topic_id, except_id=obs_id) is not None:
+            raise DuplicateObservation(f"observation exists for {url} on {topic_id}")
+        current.update(_aware(updates))
+
+    def delete_observation(self, obs_id: Any) -> bool:
+        return self.observations.pop(obs_id, None) is not None
 
     def delete_observations_for_topic(self, topic_id: str) -> int:
         doomed = [k for k, o in self.observations.items() if o.get("topic_id") == topic_id]

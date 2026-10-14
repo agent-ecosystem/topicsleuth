@@ -47,8 +47,8 @@ class MongoStore:
         self.num_candidates = num_candidates
         try:
             self.topics.create_index("topic_id", unique=True)
-            # Observation identity: one per (item_url, topic_id). The unique
-            # index is what makes a retried or doubly-fed batch safe.
+            # Observation identity: one per item per topic. The unique index
+            # is what makes a retried or doubly-fed batch safe.
             self.observations.create_index(
                 [("item_url", ASCENDING), ("topic_id", ASCENDING)], unique=True, name="item_url_topic_id_unique",
             )
@@ -159,7 +159,14 @@ class MongoStore:
         return list(self.observations.find())
 
     def update_observation(self, obs_id: Any, updates: dict) -> None:
-        self.observations.update_one({"_id": obs_id}, {"$set": updates})
+        from pymongo.errors import DuplicateKeyError
+        try:
+            self.observations.update_one({"_id": obs_id}, {"$set": updates})
+        except DuplicateKeyError as e:
+            raise DuplicateObservation(f"update would duplicate an observation: {updates}") from e
+
+    def delete_observation(self, obs_id: Any) -> bool:
+        return self.observations.delete_one({"_id": obs_id}).deleted_count > 0
 
     def delete_observations_for_topic(self, topic_id: str) -> int:
         return self.observations.delete_many({"topic_id": topic_id}).deleted_count

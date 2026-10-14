@@ -13,7 +13,7 @@ from topicsleuth.backends.memory import MemoryStore
 from topicsleuth.interfaces import ItemFailure
 from topicsleuth.record import record
 from topicsleuth.settings import load_settings
-from topicsleuth.synthesize import SynthesisDecision, synthesize_items
+from topicsleuth.synthesize import Link, SynthesisDecision, synthesize_items
 
 DIM = 8
 E_A = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
@@ -43,9 +43,11 @@ def _item(url="u1", **extra):
     return {"url": url, "title": f"Item {url}", "summary": "About A.", "tags": ["alpha"], **extra}
 
 
-def _link(url="u1", topic_id="a", strength=0.8):
+def _link(url="u1", topic_id="a", strength=0.8, *more):
+    """A link decision to topic_id, and to any further topics in ``more``."""
+    links = [Link(topic_id=t, connection_type="supports", strength=strength) for t in (topic_id, *more)]
     return SynthesisDecision(item_url=url, item_title=f"Item {url}", decision="link_existing", topic_id=topic_id,
-                             connection_type="supports", strength=strength, reasoning_trace="r")
+                             connection_type="supports", strength=strength, reasoning_trace="r", links=links)
 
 
 def _propose(url="u2", topic_id="topic-c", title="Topic C"):
@@ -56,7 +58,7 @@ def _propose(url="u2", topic_id="topic-c", title="Topic C"):
 
 FIT = {"q1_scope_expansion": False, "q2_representative_citation": True, "q3_distinguishing_evidence": True}
 LINK = {"candidate_classifications": [{"topic_id": "a", "label": "same_question"}], "decision": "link_existing",
-        "topic_id": "a", "connection_type": "supports", "fit_questions": FIT, "reasoning_trace": "fits"}
+        "links": [{"topic_id": "a", "connection_type": "supports", "fit_questions": FIT}], "reasoning_trace": "fits"}
 PROPOSE = {"candidate_classifications": [{"topic_id": "a", "label": "adjacent_question"}], "decision": "propose_new",
            "topic_id": None, "connection_type": None, "reasoning_trace": "new",
            "new_topic": {"title": "Topic C", "summary": "Tracks C.", "topic_id": "topic-c", "tags": ["gamma"]}}
@@ -183,9 +185,11 @@ def test_synthesize_reports_judge_and_embedding_failures_as_failed_decisions():
 
 @pytest.mark.parametrize("answer, reason", [
     ({**LINK, "decision": "merge"}, "unknown decision 'merge'"),
-    ({**LINK, "topic_id": "nonexistent"}, "not among the shown candidates"),
-    ({**LINK, "connection_type": "garbage"}, "unknown connection_type 'garbage'"),
-    ({**LINK, "fit_questions": None, "strength": 9}, "without the three fit questions"),
+    ({**LINK, "links": [{"topic_id": "nonexistent", "connection_type": "supports", "fit_questions": FIT}]}, "not among the shown candidates"),
+    ({**LINK, "links": [{"topic_id": "a", "connection_type": "garbage", "fit_questions": FIT}]}, "unknown connection_type 'garbage'"),
+    ({**LINK, "links": [{"topic_id": "a", "connection_type": "supports", "strength": 9}]}, "without the three fit questions"),
+    ({**LINK, "links": []}, "link_existing with no links"),
+    ({**LINK, "topic_id": "a", "connection_type": "supports", "fit_questions": FIT, "links": None}, "link_existing with no links"),
     ({**PROPOSE, "new_topic": {"topic_id": "x", "summary": "s"}}, "proposed topic has no title"),
     ({**PROPOSE, "new_topic": None}, "propose_new without a new_topic"),
 ])
@@ -333,3 +337,304 @@ def test_a_quiet_topic_that_fades_during_a_run_carries_the_run_id():
     assert snap["run_id"] == "run-9" and "recorded_at" in snap
     assert st.delete_since(datetime.now(timezone.utc) - timedelta(hours=1), run_id="run-9")["snapshots_cleared"] == 2
     assert st.get_topic("q")["snapshots"] == [], "and the run's snapshot can be removed with the run"
+
+
+# ── round 2: whole-pipeline retries, partial writes, maintenance interleaving ──
+
+def _pipeline(st, items, judge, s=None, run_id=None, embedder=None):
+    """synthesize then record, as a feeder does."""
+    s = s or _settings()
+    evals = [_Eval(i["url"], E_B if "C" in i.get("summary", "") else E_A) for i in items]
+    decisions = synthesize_items(items, evals, st, s, judge, embedder or HashEmbedder(DIM))
+    return decisions, record(items, evals, decisions, st, settings=s, run_id=run_id)
+
+
+def test_rerunning_the_pipeline_on_a_recorded_item_does_not_rejudge_or_reopen_it():
+    st = _store()
+    item = _item("u2", summary="About C.")
+    judge = ScriptedJudge([PROPOSE, CONFIRM, PROPOSE, CONFIRM])
+    first_decisions, first = _pipeline(st, [item], judge)
+    assert first_decisions[0].new_topic["topic_id"] == "topic-c" and len(first.topics_created) == 1
+    second_decisions, second = _pipeline(st, [item], judge)
+    assert len(judge.calls) == 2, "the judge was not called again"
+    assert second_decisions[0].decision == "link_existing" and second_decisions[0].topic_id == "topic-c"
+    assert "ALREADY RECORDED" in second_decisions[0].reasoning_trace
+    assert second.topics_created == [] and second.observations_created == [] and second.failures == []
+    assert len(st.get_observations_for_item("u2")) == 1
+    assert [t["topic_id"] for t in st.list_topics()] == ["a", "topic-c"], "no topic-c-2"
+
+
+def test_two_feeders_deciding_differently_about_one_document_leave_one_observation_and_no_empty_topic():
+    """Feeder A links u2 to topic a; feeder B proposes a topic for it, and A
+    records between B's pre-check and B's insert. B's proposal is a claim
+    that nothing fits, now contested: B withdraws it, drops the empty topic,
+    and fails the item so its next run resumes A's decision."""
+    st, s = _store(), _settings()
+    item, ev = _item("u2", summary="About C."), [_Eval("u2", E_B)]
+
+    class _RacingStore(MemoryStore):
+        def create_observation(self, obs_doc):
+            if obs_doc["item_url"] == "u2" and not self.get_observations_for_item("u2"):
+                super().create_observation({"topic_id": "a", "item_url": "u2", "item_title": "Item u2",
+                                            "strength": 0.8, "connection_type": "supports"})
+            return super().create_observation(obs_doc)
+    racing = _RacingStore()
+    racing.topics, racing.observations, racing._ids = st.topics, st.observations, st._ids
+    out = record([item], ev, [_propose("u2")], racing, settings=s)
+    assert out.topics_created == [] and out.observations_created == []
+    assert [(f.stage, f.error) for f in out.failures] == [("create_observation", "another writer recorded this item on ['a'] during the write; proposal withdrawn")]
+    assert racing.get_topic("topic-c") is None, "the empty topic opened for u2 was removed"
+    assert [o["topic_id"] for o in racing.get_observations_for_item("u2")] == ["a"]
+    again = record([item], ev, [_propose("u2")], racing, settings=s)
+    assert again.failures == [] and again.already_recorded[0]["topic_id"] == "a", "the retry resumes A's decision"
+
+
+class _FailOnce(MemoryStore):
+    """Fails the first call of one operation, then behaves."""
+    def __init__(self, op):
+        super().__init__()
+        self.op, self.tripped = op, False
+
+    def _trip(self, op):
+        if op == self.op and not self.tripped:
+            self.tripped = True
+            raise RuntimeError(f"injected {op} failure")
+
+    def append_snapshot(self, topic_id, snapshot):
+        self._trip("append_snapshot")
+        super().append_snapshot(topic_id, snapshot)
+
+    def update_topic(self, topic_id, updates):
+        if "status" in updates:
+            self._trip("status")
+        super().update_topic(topic_id, updates)
+
+    def save_item_embedding(self, item_url, embedding):
+        self._trip("save_item_embedding")
+        super().save_item_embedding(item_url, embedding)
+
+
+@pytest.mark.parametrize("op, stage", [("append_snapshot", "snapshot"), ("status", "status"), ("save_item_embedding", "save_embedding")])
+def test_a_retry_after_a_late_failure_finishes_the_work_without_duplicating_it(op, stage):
+    st = _FailOnce(op)
+    st.create_topic({"topic_id": "a", "title": "Topic A", "summary": "s", "embedding": E_A})
+    for i in range(4):
+        st.create_observation({"topic_id": "a", "item_url": f"a{i}", "date": datetime.now(timezone.utc)})
+    items = [_item("u1")]
+    judge = ScriptedJudge([LINK])
+    _, first = _pipeline(st, items, judge)
+    assert first.failed_urls() == {"u1"} and first.failures[0].stage == stage
+    assert len(st.get_observations_for_item("u1")) == 1, "the observation itself was written"
+    _, second = _pipeline(st, items, judge)
+    assert second.failures == [] and second.observations_created == [] and len(second.already_recorded) == 1
+    assert len(judge.calls) == 1
+    topic = st.get_topic("a")
+    assert len(topic["snapshots"]) == 1 and topic["snapshots"][0]["evidence_count"] == 5
+    assert topic["status"] == "active" and st.get_item_embeddings(["u1"]) == {"u1": E_A}
+    _, third = _pipeline(st, items, judge)
+    assert len(st.get_topic("a")["snapshots"]) == 1, "a further retry adds nothing"
+
+
+def test_a_destination_deleted_or_retired_during_the_write_leaves_no_orphan():
+    class _Maintenance(MemoryStore):
+        def create_observation(self, obs_doc):
+            oid = super().create_observation(obs_doc)
+            if obs_doc["topic_id"] == "a":
+                self.delete_topic("a")
+            if obs_doc["topic_id"] == "s":
+                self.update_topic("s", {"status": "retired", "split_into": ["s1", "s2"]})
+            if obs_doc["topic_id"] == "m":
+                self.update_topic("m", {"status": "retired", "merged_into": "t"})
+            return oid
+    st, s = _Maintenance(), _settings()
+    for tid in ("a", "s", "m", "t"):
+        st.create_topic({"topic_id": tid, "title": tid, "summary": "s", "embedding": E_A})
+    out = record([_item("u1"), _item("u2"), _item("u3")], [_Eval(u, E_A) for u in ("u1", "u2", "u3")],
+                 [_link("u1", "a"), _link("u2", "s"), _link("u3", "m")], st, settings=s)
+    assert [(f.item_url, f.error) for f in out.failures] == [
+        ("u1", "topic 'a' was deleted during the write"), ("u2", "topic 's' was retired during the write")]
+    assert st.get_observations_for_item("u1") == [] and st.get_observations_for_item("u2") == []
+    moved = st.get_observations_for_item("u3")[0]
+    assert moved["topic_id"] == "t" and moved["moved_from"] == "m" and "merged into 't' during the write" in moved["reasoning_trace"]
+    assert [o["topic_id"] for o in out.observations_created] == ["t"] and st.get_topic("t")["snapshots"][-1]["evidence_count"] == 1
+
+
+def test_merge_and_split_carry_late_arrivals_with_them():
+    from topicsleuth.merge import merge_topics
+    from topicsleuth.split import split_topic
+    st, s, emb = _store(), _settings(), HashEmbedder(DIM, vectors={"Merged\n\nAB.": E_A})
+    st.create_topic({"topic_id": "b", "title": "Topic B", "summary": "s", "embedding": E_B})
+    st.create_observation({"topic_id": "b", "item_url": "b0"})
+
+    class _LateJudge(ScriptedJudge):
+        def complete(self, system, user, max_tokens=2048):
+            st.create_observation({"topic_id": "b", "item_url": "late-b"})  # lands while the judge thinks
+            return super().complete(system, user, max_tokens)
+    merged = {"title": "Merged", "summary": "AB.", "tags": [], "suggested_directions": [], "rationale": "r"}
+    out = merge_topics("b", "a", st, s, _LateJudge([merged]), emb)
+    assert out["observations_reassigned"] == 2 and st.count_observations_for_topic("b") == 0
+    assert st.get_observations_for_item("late-b")[0]["topic_id"] == "a"
+
+    subs = {"sub_topics": [{"topic_id": "a-one", "title": "A one", "summary": "s1"}, {"topic_id": "a-two", "title": "A two", "summary": "s2"}]}
+    plan_urls = [o["item_url"] for o in st.get_observations_for_topic("a")]
+    reassign = [{"item_url": u, "new_topic_id": "a-one" if i % 2 else "a-two"} for i, u in enumerate(plan_urls)]
+
+    class _LateSplitJudge(ScriptedJudge):
+        def complete(self, system, user, max_tokens=2048):
+            if "Observations to Reassign" in user:
+                st.create_observation({"topic_id": "a", "item_url": "late-a"})
+                st.save_item_embedding("late-a", E_A)
+            return super().complete(system, user, max_tokens)
+    out = split_topic("a", st, s, _LateSplitJudge([subs, reassign]), HashEmbedder(DIM, vectors={"A one\n\ns1": E_A, "A two\n\ns2": E_B}))
+    late = st.get_observations_for_item("late-a")[0]
+    assert late["topic_id"] == "a-one" and "arrived during the split; nearest sub-topic" in late["reasoning_trace"]
+    assert st.count_observations_for_topic("a") == 0 and out["observations_reassigned"] == len(plan_urls) + 1
+
+
+def test_a_backfill_recomputes_the_later_snapshots_it_lands_before():
+    from topicsleuth.synthesize import _get_evidence_count
+    st, s = MemoryStore(), _settings()
+    st.create_topic({"topic_id": "a", "title": "Topic A", "summary": "s", "embedding": E_A, "status": "active",
+                     "date_identified": MAY, "snapshots": [{"date": JULY, "evidence_count": 6, "velocity": 6 / 7, "recorded_at": JULY, "run_id": "old"}]})
+    for i in range(6):
+        st.create_observation({"topic_id": "a", "item_url": f"a{i}", "date": JULY - timedelta(days=i)})
+    record([_item("u1", date_published=JUNE)], [_Eval("u1", E_A)], [_link("u1")], st, settings=s, date_from_item=True, run_id="new")
+    snaps = st.get_topic("a")["snapshots"]
+    assert [(x["date"], x["evidence_count"]) for x in snaps] == [(JUNE, 1), (JULY, 7)]
+    assert snaps[1]["run_id"] == "old" and snaps[1]["recorded_at"] == JULY, "the later snapshot keeps its provenance"
+    assert _get_evidence_count(st.get_topic("a")) == 7, "what the judge is shown includes the backfill"
+
+
+def test_split_rejects_an_unknown_connection_type_before_writing():
+    from topicsleuth.split import SplitPlanError, split_topic
+    st, emb = _store(), HashEmbedder(DIM)
+    subs = {"sub_topics": [{"topic_id": "a-one", "title": "A one", "summary": "s1"}, {"topic_id": "a-two", "title": "A two", "summary": "s2"}]}
+    plan = [{"item_url": "a0", "new_topic_id": "a-one", "new_connection_type": "garbage"},
+            {"item_url": "a1", "new_topic_id": "a-two"}, {"item_url": "a2", "new_topic_id": "a-two"}]
+    with pytest.raises(SplitPlanError, match="'a0' has unknown connection type 'garbage'"):
+        split_topic("a", st, _settings(), ScriptedJudge([subs, plan]), emb)
+    assert st.get_topic("a-one") is None and st.count_observations_for_topic("a") == 3 and emb.calls == []
+
+
+# ── a document is evidence for every question it bears on ──
+
+def test_a_link_decision_with_two_topics_records_two_observations_each_scored_on_its_own():
+    st = _store()
+    st.create_topic({"topic_id": "b", "title": "Topic B", "summary": "Tracks B.", "embedding": E_B})
+    for i in range(20):
+        st.create_observation({"topic_id": "b", "item_url": f"b{i}", "strength": 0.9})
+    yes, no = True, False
+    two = {**LINK, "candidate_classifications": [{"topic_id": "a", "label": "same_question"}, {"topic_id": "b", "label": "same_question"}],
+           "links": [{"topic_id": "a", "connection_type": "extends", "fit_questions": {"q1_scope_expansion": yes, "q2_representative_citation": yes, "q3_distinguishing_evidence": yes}},
+                     {"topic_id": "b", "connection_type": "supports", "fit_questions": {"q1_scope_expansion": no, "q2_representative_citation": no, "q3_distinguishing_evidence": yes}}]}
+    decisions, out = _pipeline(_store_with(st), [_item("u1", tags=["alpha", "beta"])], ScriptedJudge([two]))
+    d = decisions[0]
+    assert [(l.topic_id, l.strength, l.connection_type) for l in d.links] == [("a", 0.95, "extends"), ("b", 0.5, "supports")]
+    assert d.topic_id == "a" and d.strength == 0.95, "the scalar fields mirror the first link"
+    assert out.failures == [] and [(o["topic_id"], o["strength"], o["minor"]) for o in out.observations_created] == [("a", 0.95, False), ("b", 0.5, True)]
+    assert out.observations_created[1]["fit_questions"]["q3_distinguishing_evidence"] is True
+    assert sorted(out.topics_updated) == ["a", "b"] and st.get_topic("b")["snapshots"][-1]["evidence_count"] == 21
+    assert "Fit questions for a:" in d.reasoning_trace and "Fit questions for b:" in d.reasoning_trace
+
+
+def _store_with(st):
+    """The store's topics need an embedding the hash embedder's candidate
+    search will find; _store() already provides one."""
+    return st
+
+
+def test_the_gate_forces_links_to_every_same_question_candidate():
+    st = _store()
+    st.create_topic({"topic_id": "b", "title": "Topic B", "summary": "Tracks B.", "embedding": E_B})
+    answer = {**PROPOSE, "candidate_classifications": [{"topic_id": "a", "label": "same_question"}, {"topic_id": "b", "label": "same_question"}]}
+    decisions, out = _pipeline(st, [_item("u2", summary="About C.")], ScriptedJudge([answer]))
+    d = decisions[0]
+    assert d.decision == "link_existing" and sorted(l.topic_id for l in d.links) == ["a", "b"]
+    assert d.links[0].topic_id == "a", "most evidence first"
+    assert "Forced links to ['a', 'b']" in d.reasoning_trace and out.failures == []
+    assert sorted(o["topic_id"] for o in out.observations_created) == ["a", "b"] and st.get_topic("topic-c") is None
+
+
+def test_a_retry_of_a_multi_link_item_adds_nothing():
+    st, s = _store(), _settings()
+    st.create_topic({"topic_id": "b", "title": "Topic B", "summary": "Tracks B.", "embedding": E_B})
+    judge = ScriptedJudge([LINK])
+    items = [_item("u1")]
+    evals = [_Eval("u1", E_A)]
+    first = record(items, evals, [_link("u1", "a", 0.8, "b")], st, settings=s)
+    assert [o["topic_id"] for o in first.observations_created] == ["a", "b"]
+    decisions = synthesize_items(items, evals, st, s, judge, HashEmbedder(DIM))
+    assert judge.calls == [] and sorted(l.topic_id for l in decisions[0].links) == ["a", "b"]
+    second = record(items, evals, decisions, st, settings=s)
+    assert second.observations_created == [] and sorted(o["topic_id"] for o in second.already_recorded) == ["a", "b"]
+    assert len(st.get_observations_for_item("u1")) == 2
+
+
+def test_merging_two_topics_that_share_a_document_folds_it_into_one_observation():
+    from topicsleuth.merge import merge_topics
+    st, s = _store(), _settings()
+    st.create_topic({"topic_id": "b", "title": "Topic B", "summary": "Tracks B.", "embedding": E_B})
+    st.create_observation({"topic_id": "b", "item_url": "a0", "item_title": "A 0", "strength": 0.5, "connection_type": "extends"})
+    st.create_observation({"topic_id": "b", "item_url": "only-b", "item_title": "Only B", "strength": 0.9})
+    merged = {"title": "Merged", "summary": "AB.", "tags": [], "suggested_directions": [], "rationale": "r"}
+    out = merge_topics("b", "a", st, s, ScriptedJudge([merged]), HashEmbedder(DIM, vectors={"Merged\n\nAB.": E_A}))
+    assert out["observations_reassigned"] == 2 and st.count_observations_for_topic("b") == 0
+    kept = st.get_observations_for_item("a0")
+    assert len(kept) == 1 and kept[0]["topic_id"] == "a" and kept[0]["strength"] == 0.9, "the target's observation survives"
+    assert "FOLDED by merge" in kept[0]["reasoning_trace"] and "strength 0.5, extends" in kept[0]["reasoning_trace"]
+    assert st.get_observations_for_item("only-b")[0]["topic_id"] == "a" and st.count_observations_for_topic("a") == 4
+
+
+# ── the two floors are settings ──
+
+def test_the_secondary_link_floor_drops_weak_later_links_but_never_the_first():
+    st = _store()
+    st.create_topic({"topic_id": "b", "title": "Topic B", "summary": "Tracks B.", "embedding": E_B})
+    st.create_topic({"topic_id": "c", "title": "Topic C", "summary": "Tracks C.", "embedding": E_B})
+    yes, no = True, False
+    weak_first = {**LINK, "candidate_classifications": [{"topic_id": t, "label": "same_question"} for t in ("a", "b", "c")],
+                  "links": [{"topic_id": "a", "connection_type": "supports", "fit_questions": {"q1_scope_expansion": no, "q2_representative_citation": no, "q3_distinguishing_evidence": no}},
+                            {"topic_id": "b", "connection_type": "supports", "fit_questions": {"q1_scope_expansion": no, "q2_representative_citation": no, "q3_distinguishing_evidence": yes}},
+                            {"topic_id": "c", "connection_type": "supports", "fit_questions": {"q1_scope_expansion": yes, "q2_representative_citation": yes, "q3_distinguishing_evidence": no}}]}
+    s = load_settings(overrides={"domain": "widget manufacturing", "embedding": {"dimensions": DIM},
+                                 "candidates": {"vector_limit": 5}, "synthesize": {"secondary_link_floor": 0.6}})
+    decisions, out = _pipeline(st, [_item("u1")], ScriptedJudge([weak_first]), s=s)
+    d = decisions[0]
+    assert [(l.topic_id, l.strength) for l in d.links] == [("a", 0.3), ("c", 0.8)], "the first link stands at 0.3; b dropped at 0.5; c kept"
+    assert d.diagnostics["dropped_links"] == [{"topic_id": "b", "strength": 0.5}]
+    assert "SECONDARY LINKS DROPPED (below floor 0.6): b at 0.5" in d.reasoning_trace
+    assert sorted(o["topic_id"] for o in out.observations_created) == ["a", "c"]
+    off = load_settings(overrides={"domain": "widget manufacturing", "embedding": {"dimensions": DIM}, "candidates": {"vector_limit": 5}})
+    decisions, _ = _pipeline(st, [_item("u9")], ScriptedJudge([weak_first]), s=off)
+    assert len(decisions[0].links) == 3 and decisions[0].diagnostics["dropped_links"] == [], "the default floor keeps every link"
+
+
+def test_the_minor_floor_comes_from_settings():
+    st = _store()
+    tight = load_settings(overrides={"domain": "widget manufacturing", "embedding": {"dimensions": DIM},
+                                     "record": {"minor_floor_after": 3, "minor_floor_strength": 0.9}})
+    out = record([_item("u1")], [_Eval("u1", E_A)], [_link("u1", "a", 0.8)], st, settings=tight)
+    assert out.observations_created[0]["minor"] is True, "three observations already; 0.8 is under the 0.9 floor"
+    out = record([_item("u2")], [_Eval("u2", E_A)], [_link("u2", "a", 0.8)], st, settings=_settings())
+    assert out.observations_created[0]["minor"] is False, "the default floor applies from twenty"
+
+
+def test_replay_summary_reports_secondary_links_and_drops(tmp_path):
+    import json
+    from topicsleuth.tune import replay_synthesis
+    st = _store()
+    st.create_topic({"topic_id": "b", "title": "Topic B", "summary": "Tracks B.", "embedding": E_B})
+    st.items["u1"] = {"url": "u1", "title": "Item u1", "summary": "s", "embedding": E_A, "tags": ["alpha"]}
+    yes, no = True, False
+    two = {**LINK, "candidate_classifications": [{"topic_id": "a", "label": "same_question"}, {"topic_id": "b", "label": "same_question"}],
+           "links": [{"topic_id": "a", "connection_type": "supports", "fit_questions": FIT},
+                     {"topic_id": "b", "connection_type": "supports", "fit_questions": {"q1_scope_expansion": no, "q2_representative_citation": no, "q3_distinguishing_evidence": yes}}]}
+    prior = tmp_path / "prior.json"
+    prior.write_text(json.dumps({"decisions": [{"item_url": "u1"}]}))
+    s = load_settings(overrides={"domain": "widget manufacturing", "embedding": {"dimensions": DIM},
+                                 "candidates": {"vector_limit": 5}, "synthesize": {"secondary_link_floor": 0.6}})
+    report = replay_synthesis(st, ScriptedJudge([two]), HashEmbedder(DIM), settings=s, replay_from=prior,
+                              output_path=tmp_path / "out.json", progress=False, label="t")
+    assert report["summary"]["links"] == {"total": 1, "per_link_decision": 1.0, "multi_link_decisions": 0,
+                                           "secondary": 0, "secondary_strength_buckets": {}, "dropped_by_floor": 1}
+    assert report["config"]["synthesize"]["secondary_link_floor"] == 0.6

@@ -41,3 +41,12 @@ synthesize:
   confirm_candidates: 5
   confirm_backend: judge       # judge | decision
   confirm_link_threshold: 0.7  # decision backend: p(belongs) needed to demote a proposal to a link
+  # A link decision may name several topics. The first link always stands;
+  # a later one scoring below this floor is dropped. 0 keeps them all.
+  secondary_link_floor: 0.0
+
+record:
+  # Once a topic holds minor_floor_after observations, a new one scoring
+  # below minor_floor_strength is filed but marked minor.
+  minor_floor_after: 20
+  minor_floor_strength: 0.7
