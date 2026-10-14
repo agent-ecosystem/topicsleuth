@@ -175,11 +175,17 @@ uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -e ".[al
 .venv/bin/python -m pytest
 ```
 
-The tests are hermetic. Deterministic parts (strength derivation, gate
-enforcement, JSON recovery, threshold crossings, move planning, audit
-bucketing) are unit tested; the record path runs end to end against
-`MemoryStore`. Anything that calls a model is exercised by replays against
-a real store. `DESIGN.md` records the reasoning behind the interfaces.
+The suite runs offline. `topicsleuth.backends.fake` provides a hashing
+embedder, a scripted judge and a scripted decision model; with
+`MemoryStore` they drive the decision, record, curation and replay paths
+end to end, and every CLI command runs in process against them (select
+them with `TOPICSLEUTH_STORE=memory`, `TOPICSLEUTH_JUDGE=scripted`,
+`TOPICSLEUTH_EMBEDDER=hash`, `TOPICSLEUTH_DECISION=scripted`). The same
+fakes are available to your own tests. The store contract in
+`tests/test_store_contract.py` runs against `MemoryStore` always and
+against `MongoStore` when `TOPICSLEUTH_TEST_MONGODB_URI` names an Atlas
+cluster; it creates scratch collections and a vector index there and drops
+them afterwards. `DESIGN.md` records the reasoning behind the interfaces.
 
 Releases publish to PyPI by trusted publishing from a `v*` tag
 (`.github/workflows/publish.yml`).

@@ -16,5 +16,5 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
-      - run: python -m pip install -e ".[test]"
+      - run: python -m pip install -e ".[all,test]"
       - run: python -m pytest

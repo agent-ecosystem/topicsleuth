@@ -7,6 +7,10 @@ for feeders that are happy with the defaults.
     TOPICSLEUTH_EMBEDDING_MODEL  default voyage-4         (VOYAGE_API_KEY read by the SDK)
     TOPICSLEUTH_DECISION_MODEL   default jev-latest       (TYPESAFE_API_KEY; optional)
 
+For tests: TOPICSLEUTH_STORE=memory, TOPICSLEUTH_JUDGE=scripted,
+TOPICSLEUTH_EMBEDDER=hash and TOPICSLEUTH_DECISION=scripted select the
+process-wide fakes from topicsleuth.backends.fake instead.
+
 Library code never reads these; only this module and the CLI do.
 """
 from __future__ import annotations
@@ -27,6 +31,9 @@ class Backends:
 
 
 def store_from_env(settings: Settings) -> Store:
+    if os.environ.get("TOPICSLEUTH_STORE") == "memory":
+        from topicsleuth.backends.fake import shared
+        return shared("store")
     from topicsleuth.backends.mongo import MongoStore
     uri = os.environ.get("MONGODB_URI")
     if not uri:
@@ -40,6 +47,11 @@ def store_from_env(settings: Settings) -> Store:
 
 
 def embedder_from_env(settings: Settings) -> Embedder:
+    if os.environ.get("TOPICSLEUTH_EMBEDDER") == "hash":
+        from topicsleuth.backends.fake import shared
+        embedder = shared("embedder")
+        embedder.dimensions = settings.embedding.dimensions
+        return embedder
     from topicsleuth.backends.voyage import VoyageEmbedder
     return VoyageEmbedder(
         model=os.environ.get("TOPICSLEUTH_EMBEDDING_MODEL", "voyage-4"),
@@ -48,11 +60,17 @@ def embedder_from_env(settings: Settings) -> Embedder:
 
 
 def judge_from_env() -> Judge:
+    if os.environ.get("TOPICSLEUTH_JUDGE") == "scripted":
+        from topicsleuth.backends.fake import shared
+        return shared("judge")
     from topicsleuth.backends.anthropic import AnthropicJudge
     return AnthropicJudge(model=os.environ.get("TOPICSLEUTH_JUDGE_MODEL", "claude-opus-4-8"))
 
 
 def decision_model_from_env() -> DecisionModel | None:
+    if os.environ.get("TOPICSLEUTH_DECISION") == "scripted":
+        from topicsleuth.backends.fake import shared
+        return shared("decision_model")
     key = os.environ.get("TYPESAFE_API_KEY")
     if not key:
         return None

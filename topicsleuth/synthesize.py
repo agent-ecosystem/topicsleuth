@@ -1113,9 +1113,7 @@ def synthesize_item(
     leave_one_out: bool = False,
     decision_model: DecisionModel | None = None,
 ) -> SynthesisDecision:
-    all_topics = [
-        t for t in store.get_all_topics() if t.get("status") != "retired"
-    ]
+    all_topics = store.list_topics(include_retired=False)
 
     # Replay mode (tune.py): the item has already been recorded, so the topic
     # it founded, and its own title among representative observations, would
