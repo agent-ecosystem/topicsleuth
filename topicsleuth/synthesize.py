@@ -187,7 +187,7 @@ incremental — strength ends up in the upper band.
 - A paper on RL training that briefly observes some agent failures, judged \
 against "Agent Failure Mode Detection" rated `surface_overlap` (the \
 question is RL training, failures are incidental): do not link, even at low \
-strength. Either link to a training-topicd candidate or skip.
+strength. Either link to a training-topic candidate or skip.
 
 - A changelog entry from a harness vendor adding sandboxed tool execution, \
 judged against "Are harness vendors sandboxing agent tool execution by \

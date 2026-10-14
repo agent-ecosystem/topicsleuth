@@ -102,6 +102,7 @@ def _compute_snapshot(store: Store, topic_id: str, now: datetime) -> dict:
         days_since = (now_naive - latest).total_seconds() / 86400.0
         recency_weight = 1.0 / (1.0 + days_since)
     else:
+        days_since = None
         recency_weight = 0.0
 
     return {
@@ -111,6 +112,7 @@ def _compute_snapshot(store: Store, topic_id: str, now: datetime) -> dict:
         "source_type_diversity": len(source_types),
         "velocity": velocity,
         "recency_weight": recency_weight,
+        "days_since_evidence": days_since,
     }
 
 
@@ -135,9 +137,10 @@ def _detect_transition(
         if velocity < STATUS_THRESHOLDS["fading_velocity"]:
             new_status = "fading"
     elif current_status == "fading":
+        days_since = snapshot.get("days_since_evidence")
         if velocity >= STATUS_THRESHOLDS["fading_velocity"]:
             new_status = "active"
-        elif snapshot["recency_weight"] < 0.1:
+        elif days_since is None or days_since >= STATUS_THRESHOLDS["dormant_days"]:
             new_status = "dormant"
     elif current_status == "dormant":
         if velocity > 0:
@@ -164,7 +167,9 @@ def record(
     date_from_item: bool = False,
 ) -> RecordResult:
     """Persist a batch: new topics, their observations, item embeddings,
-    then a snapshot and status check on every topic touched.
+    then a snapshot and status check on every topic touched, and a status
+    check on every topic that was not, so a question that stops drawing
+    evidence fades and goes dormant on its own.
 
     The feeder's own scores for an item are not written here; a feeder
     persists its evaluation under its own key. With backfill=True every
@@ -350,13 +355,36 @@ def record(
 
         transition = _detect_transition(topic, snapshot)
         if transition:
-            store.update_topic(topic_id, {"status": transition["to_status"]})
-            result.transitions.append(transition)
-            logger.info(
-                "Topic transition: %s %s -> %s",
-                topic_id,
-                transition["from_status"],
-                transition["to_status"],
-            )
+            _apply_transition(store, result, transition)
+
+    # 5. Status check on the quiet topics. A topic that received nothing
+    #    this run can only fade or go dormant, and nothing else would ever
+    #    look at it. The check is as of this run's "now", or, when loading
+    #    history, the latest date in the batch, so history reads as history.
+    #    A snapshot is written only when the status changes, so a long quiet
+    #    spell does not pile up identical snapshots.
+    as_of = max(batch_dates.values(), default=None) if date_from_item else now
+    if as_of is not None:
+        for topic in store.list_topics(include_retired=False):
+            topic_id = topic["topic_id"]
+            if topic_id in affected_topics:
+                continue
+            snapshot = _compute_snapshot(store, topic_id, as_of)
+            transition = _detect_transition(topic, snapshot)
+            if transition:
+                store.append_snapshot(topic_id, snapshot)
+                result.topics_updated.append(topic_id)
+                _apply_transition(store, result, transition)
 
     return result
+
+
+def _apply_transition(store: Store, result: RecordResult, transition: dict) -> None:
+    store.update_topic(transition["topic_id"], {"status": transition["to_status"]})
+    result.transitions.append(transition)
+    logger.info(
+        "Topic transition: %s %s -> %s",
+        transition["topic_id"],
+        transition["from_status"],
+        transition["to_status"],
+    )

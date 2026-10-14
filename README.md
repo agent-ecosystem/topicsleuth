@@ -1,12 +1,12 @@
 # topicsleuth
 
-You follow a field. Documents arrive every day: papers, release notes,
-posts, discussion threads. topicsleuth remembers them for you. It works out
-which ongoing question each new document belongs to, keeps the evidence
-for every question in one place, and tells you which questions are
-gathering momentum, settling, or going quiet. It is the memory behind a
-daily briefing, so that "what happened to that thing from two weeks ago?"
-has an answer.
+You're interested in something specific. New content arrives every day:
+papers, release notes, posts, discussion threads. topicsleuth remembers
+them for you. It works out which ongoing question each new document
+belongs to, keeps the content related to every question in one place,
+and tells you which questions are gathering momentum, settling, or going
+quiet. It is the memory behind the topics you care about, so
+"what happened to that thing from two weeks ago?" has an answer.
 
 If that is the problem you have, the next section gets you running. The
 rest of this page explains what the library does and how, so you can
@@ -14,9 +14,33 @@ decide whether it fits before you commit to it.
 
 ## Try it in five minutes
 
+To use topicsleuth with the default store, you need:
+
+- Python 3.12 or higher
+- A MongoDB Atlas cluster
+- A vector search index on the `topics` collection with:
+  - path `embedding`
+  - cosine similarity
+  - number of dimensions matching your embedding model
+  - index name `topic_embedding_index`
+- API keys for:
+  - Voyage embeddings
+  - Anthropic
+
+Other databases and models work too; see "Bring your own models and
+database" below.
+
+### Install topicsleuth
+
 ```bash
 pip install "topicsleuth[all]"
 ```
+
+### Use the library
+
+To use the default clients, import from `backends`. Otherwise,
+import `record`, `settings`, and `synthesize` to make and store
+observations related to your topics:
 
 ```python
 from topicsleuth.backends.anthropic import AnthropicJudge
@@ -47,36 +71,63 @@ for obs in result.observations_created:
     print(f"{obs['item_title']} -> {obs['topic_id']} ({obs['connection_type']})")
 ```
 
-You need Python 3.12, a MongoDB Atlas cluster with a vector search index
-on the topics collection (path `embedding`, cosine, dimensions matching
-your embedding model, named `topic_embedding_index`), and API keys for
-Voyage and Anthropic in your environment. Other databases and models work
-too; see "Bring your own models and database" below.
-
-## Keep track of a field across days, not just today
+## Keep track of content across days, not just today
 
 Anyone who reads a feed and writes a summary ends up with the same thing:
 a good account of today, and no connection to yesterday. The paper from
 February, the product launch in June and the tutorial this morning are
-one story, an idea becoming a product becoming practice. A daily summary
-cannot tell that story because it has no memory, and a duplicate detector
-cannot help because none of those three documents is a duplicate of the
-others.
+one story; an idea becomes a product which begets a practice. Your daily
+summary can't tell that story because it has no memory.
 
-What is missing is a notebook with one page per question. Not "security",
-which is a subject, but a question the field keeps working on, such as
-"do coding assistants make developers write less secure code?" A question
-is the right size for a page: specific enough that a document clearly
-belongs on it or does not, broad enough to gather evidence for months.
+Think of topicsleuth as the tool that helps you keep a notebook with one
+page per question. A subject like "security" is too broad. Instead, the
+topic is a question the field keeps working on, such as "do coding
+assistants make developers write less secure code?" A question is the
+right size for a page: specific enough that a document clearly belongs
+on it or not, but also broad enough to gather evidence for months.
 
-topicsleuth keeps that notebook. It calls a page a **topic**, and an entry
-on a page an **observation**: which document, how strongly it bears on the
-question, and in what way, whether it supports what the page already says,
-extends it, contradicts it, or marks a shift. When a document arrives that
-raises a question with no page yet, it opens one. And because the entries
-on each page are dated, it can measure what a summary never could: how
-fast a question is gathering evidence, from how many different sources,
-and whether it is just emerging, active, mature, fading, or dormant.
+When you let topicsleuth keep that notebook, each piece of content that
+bears on a question becomes an **observation** on that topic's page. An
+observation records which document it was, how strongly it bears on the
+question, and a label that says how it connects to what's already in the
+topic. The label is there for you, the reader of the page. A judge model
+chooses it when it files the observation, and the library keeps it beside
+the strength, so that when you open a topic you can see at a glance which
+entries agree with each other and which ones pushed the question somewhere
+new. An observation can relate to its topic in one of four ways:
+
+- **supports**: adds evidence consistent with what the topic already says.
+  Most observations are this.
+- **extends**: broadens the question by bringing in a facet, method, or
+  kind of source the page had not covered.
+- **contradicts**: offers evidence against the topic's claim.
+- **shifts**: marks a change in the topic's trajectory, such as the first
+  vendor to turn a practice on by default.
+
+When a piece of content arrives that raises a question with no page yet,
+it starts a new one. And because the entries on each page are dated, it can
+measure what a summary never could: how fast a question is gathering
+evidence, from how many different sources, and where the question is in
+its life. Every topic carries a status that moves as evidence arrives or
+stops arriving:
+
+- **emerging**: a new page with fewer than five observations. It may be
+  the start of something, or a one-off.
+- **active**: five or more observations. The question has drawn repeated
+  evidence.
+- **mature**: twenty or more observations, a well-established thread. From
+  here on, a weak match (strength below 0.7) is still filed but marked
+  minor, so a mature topic does not drift on tangential links.
+- **fading**: an active or mature topic that has gone a week with no new
+  evidence. Fresh evidence sends it back to active.
+- **dormant**: a fading topic whose last evidence is thirty days old or
+  more. Fresh evidence sends it back to emerging, to earn its place again.
+
+The library checks every topic's status on every run, not only the ones
+that received evidence, so a question that goes quiet fades on its own.
+
+Topics you merge or split are marked **retired** and keep a pointer to
+what replaced them, so old links still resolve.
 
 ## Know whether it fits before you build on it
 
