@@ -10,8 +10,8 @@ import json
 
 import pytest
 
+from topicsleuth.rubric import derive_strength
 from topicsleuth.synthesize import (
-    _derive_strength,
     _enforce_link_gate,
     _extract_json_object,
     _normalize_json_text,
@@ -26,28 +26,28 @@ class TestDeriveStrength:
     """The 3-question rubric should map to the documented strength table."""
 
     def test_all_three_yes_returns_top_band(self):
-        assert _derive_strength({
+        assert derive_strength({
             "q1_scope_expansion": True,
             "q2_representative_citation": True,
             "q3_distinguishing_evidence": True,
         }) == 0.95
 
     def test_q2_plus_q1_returns_strong_band(self):
-        assert _derive_strength({
+        assert derive_strength({
             "q1_scope_expansion": True,
             "q2_representative_citation": True,
             "q3_distinguishing_evidence": False,
         }) == 0.80
 
     def test_q2_plus_q3_returns_strong_band(self):
-        assert _derive_strength({
+        assert derive_strength({
             "q1_scope_expansion": False,
             "q2_representative_citation": True,
             "q3_distinguishing_evidence": True,
         }) == 0.80
 
     def test_q2_only_returns_mid_band(self):
-        assert _derive_strength({
+        assert derive_strength({
             "q1_scope_expansion": False,
             "q2_representative_citation": True,
             "q3_distinguishing_evidence": False,
@@ -55,43 +55,43 @@ class TestDeriveStrength:
 
     def test_q1_alone_returns_low_band(self):
         # Q2=no but at least one other yes.
-        assert _derive_strength({
+        assert derive_strength({
             "q1_scope_expansion": True,
             "q2_representative_citation": False,
             "q3_distinguishing_evidence": False,
         }) == 0.50
 
     def test_q3_alone_returns_low_band(self):
-        assert _derive_strength({
+        assert derive_strength({
             "q1_scope_expansion": False,
             "q2_representative_citation": False,
             "q3_distinguishing_evidence": True,
         }) == 0.50
 
     def test_all_three_no_returns_floor(self):
-        assert _derive_strength({
+        assert derive_strength({
             "q1_scope_expansion": False,
             "q2_representative_citation": False,
             "q3_distinguishing_evidence": False,
         }) == 0.30
 
     def test_none_input_returns_none(self):
-        assert _derive_strength(None) is None
+        assert derive_strength(None) is None
 
     def test_empty_dict_returns_none(self):
-        assert _derive_strength({}) is None
+        assert derive_strength({}) is None
 
     def test_missing_keys_returns_none(self):
-        assert _derive_strength({"q1_scope_expansion": True}) is None
+        assert derive_strength({"q1_scope_expansion": True}) is None
 
     def test_non_dict_returns_none(self):
-        assert _derive_strength("yes") is None
-        assert _derive_strength(["q1", "q2", "q3"]) is None
+        assert derive_strength("yes") is None
+        assert derive_strength(["q1", "q2", "q3"]) is None
 
     def test_truthy_values_treated_as_yes(self):
         # The function calls bool() on each value, so non-boolean truthy
         # values should still produce the all-three-yes outcome.
-        assert _derive_strength({
+        assert derive_strength({
             "q1_scope_expansion": 1,
             "q2_representative_citation": "yes",
             "q3_distinguishing_evidence": [1],

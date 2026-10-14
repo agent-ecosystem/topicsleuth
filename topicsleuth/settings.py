@@ -12,11 +12,13 @@ YAML file or a dict of overrides on top.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from topicsleuth.rubric import RubricConfig
 
 DEFAULT_SETTINGS_PATH = Path(__file__).resolve().parent / "config" / "settings.yaml"
 
@@ -78,6 +80,10 @@ class Settings:
     # What the store follows, as a noun phrase the prompts are rendered
     # with: "the coding agent ecosystem", "climate policy", "my industry".
     domain: str = "the field this store follows"
+    # The prose in the prompts that describes that field: what kinds of
+    # source arrive, what a right-sized question looks like there, the
+    # counter-examples. See RubricConfig in topicsleuth.rubric.
+    rubric: RubricConfig = field(default_factory=RubricConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     candidates: CandidateConfig = field(default_factory=CandidateConfig)
     synthesize: SynthesizeConfig = field(default_factory=SynthesizeConfig)
@@ -93,9 +99,27 @@ def _deep_merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _rubric_from_raw(raw: dict[str, Any]) -> RubricConfig:
+    known = {f.name for f in fields(RubricConfig)}
+    unknown = set(raw) - known
+    if unknown:
+        raise ValueError(f"unknown rubric settings: {sorted(unknown)}; known: {sorted(known)}")
+    for key in ("evidence_kinds", "question_examples", "counter_examples"):
+        if key in raw and not isinstance(raw[key], list):
+            raise ValueError(f"rubric.{key} must be a list")
+    for ex in raw.get("question_examples", []):
+        if not isinstance(ex, dict) or set(ex) != {"question", "subject"}:
+            raise ValueError(
+                "each rubric.question_examples entry needs exactly the keys "
+                f"'question' and 'subject', got {ex!r}"
+            )
+    return RubricConfig(**raw)
+
+
 def _from_raw(raw: dict[str, Any]) -> Settings:
     return Settings(
         domain=raw.get("domain", Settings.domain),
+        rubric=_rubric_from_raw(raw.get("rubric") or {}),
         embedding=EmbeddingConfig(**raw.get("embedding", {})),
         candidates=CandidateConfig(**raw.get("candidates", {})),
         synthesize=SynthesizeConfig(**raw.get("synthesize", {})),

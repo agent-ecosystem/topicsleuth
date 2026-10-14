@@ -210,13 +210,17 @@ def replay_synthesis(
     progress: bool = True,
     replay_from: Path | None = None,
     label: str | None = None,
-    leave_one_out: bool = False,
 ) -> dict[str, Any]:
     """Replay synthesize against a sample of already-processed items.
 
     With replay_from, reuse the exact items of that prior run instead of
     drawing a fresh sample. Returns the run report dict and writes it to
     output_path as JSON.
+
+    Every item is replayed leave-one-out: the topic it founded, if that
+    topic holds nothing else, and its own title are hidden from the judge.
+    Without that a replay shows an item its historical answer and flatters
+    itself, so it is not an option.
     """
     settings = settings or load_settings()
     sample_query = sample_query or {}
@@ -236,8 +240,7 @@ def replay_synthesis(
             f"tag_overlap={settings.candidates.tag_overlap} "
             f"ignored_tags={settings.candidates.ignored_tags} "
             f"confirm_proposals={settings.synthesize.confirm_proposals} "
-            f"confirm_backend={settings.synthesize.confirm_backend} "
-            f"leave_one_out={leave_one_out}"
+            f"confirm_backend={settings.synthesize.confirm_backend}"
         )
         print()
 
@@ -254,7 +257,7 @@ def replay_synthesis(
         try:
             decision = synthesize_item(
                 item, eval_result, store, settings, judge,
-                proposed_in_batch, leave_one_out=leave_one_out,
+                proposed_in_batch, leave_one_out=True,
                 decision_model=decision_model,
             )
         except Exception as e:
@@ -294,7 +297,6 @@ def replay_synthesis(
         "sample_query": sample_query,
         "replay_from": str(replay_from) if replay_from else None,
         "label": label,
-        "leave_one_out": leave_one_out,
         "topic_universe": len(store.list_topics(include_retired=False)),
         "config": {
             "model": getattr(judge, "model", None),

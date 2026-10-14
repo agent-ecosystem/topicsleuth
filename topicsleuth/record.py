@@ -9,6 +9,7 @@ from topicsleuth.embeddings import (
     refresh_topic_embedding,
 )
 from topicsleuth.interfaces import Embedder, Store
+from topicsleuth.rubric import DEFAULT_CONNECTION_TYPE
 from topicsleuth.settings import Settings, load_settings
 from topicsleuth.synthesize import ItemEval, SynthesisDecision
 
@@ -265,7 +266,7 @@ def record(
             "topic_id": topic_id,
             "date": obs_date,
             "strength": decision.strength if decision.strength is not None else 0.7,
-            "connection_type": decision.connection_type or "supports",
+            "connection_type": decision.connection_type or DEFAULT_CONNECTION_TYPE,
             "reasoning_trace": decision.reasoning_trace,
             "source_name": item.get("source_name", "") if item else "",
             "source_type": item.get("source_type", "") if item else "",

@@ -56,11 +56,13 @@ shipped for the same reason: a consumer's tests should not need a model.
 ## Settings
 
 Settings are the decisions two feeders writing one store must agree on:
-the embedding dimensionality the index was built for, how candidates are
+the domain and the rubric prose the prompts are rendered with, the
+embedding dimensionality the index was built for, how candidates are
 assembled (vector limit, tag overlap, ignored routing tags), and the
 link-or-propose controls (whether proposals are reviewed, by which backend,
 at what threshold). They ship as packaged defaults and a feeder layers a
-YAML file or a dict on top.
+YAML file or a dict on top. The CLI reads that file from
+`TOPICSLEUTH_SETTINGS`.
 
 Model names are not settings. They are properties of the Judge and
 Embedder a caller constructs, and the replay reports record whichever were
@@ -77,11 +79,27 @@ on the store it was tuned on: the right topic was in the vector top-30 for
 reviewed by an independent second pass, because a wrong link is one noisy
 observation and a wrong proposal is a permanent singleton.
 
-The prompts are rendered with the domain the store follows
-(`settings.domain`). They frame a topic as the question it tracks, not a
-subject area, and read each item by its kind (a paper proposes or measures, a release
-ships, a tutorial shows use) so that a release and a paper on the same
-question land on the same topic.
+Everything a model is told lives in `topicsleuth/rubric.py`: what a
+right-sized topic is, the relationship labels and their criteria, the
+decision rules, the fit questions, the connection types, and the prompts
+assembled from those pieces. A definition appears once and every prompt
+that needs it renders the same text; the decision model gets the same
+criteria as data. The strength maps live beside the questions they score.
+
+The rubric has two kinds of text, and the line between them is the
+library's customization boundary. The structure (labels, rules, fit
+questions, connection types, response formats) is fixed in code because
+the parser, the strength map and the store depend on it; changing it is a
+fork. The prose that describes a field (the kinds of source, how each
+kind bears on a question, what a right-sized question looks like, the
+counter-examples) is `RubricConfig`, set per store under `rubric:` in
+settings next to `domain`, because a judge that reasons about papers and
+releases is wrong for a feed of filings and minutes. Whole-prompt
+overrides were rejected: they would let a consumer break the response
+format silently and would undo the single source. The prompts frame a
+topic as the question it tracks, not a subject area, and read each item
+by its kind so that two kinds of source on the same question land on the
+same topic.
 
 The strength rubric is three yes/no questions mapped to a score
 downstream, never a number the model emits.
@@ -89,8 +107,10 @@ downstream, never a number the model emits.
 ## Tuning
 
 `tune synthesize` replays the decision against recorded items without
-writing, with `--leave-one-out` hiding each item's own singleton topic so
-the replay cannot see its historical answer. A store's baselines and its
+writing. Every replay is leave-one-out: each item's own singleton topic
+and its own title are hidden so the replay cannot see its historical
+answer. That is not a flag, because a replay that can see the answer
+measures nothing. A store's baselines and its
 relationship label set describe that store's content, so they live with
 the feeder that owns it; this repository ships the tools and synthetic
 examples of the file shapes under `data/examples/`.

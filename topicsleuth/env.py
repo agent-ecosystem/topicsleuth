@@ -3,6 +3,7 @@ for feeders that are happy with the defaults.
 
     MONGODB_URI             connection string (required for the store)
     TOPICSLEUTH_DATABASE    database name (default: topicsleuth)
+    TOPICSLEUTH_SETTINGS    path to a settings YAML layered over the packaged defaults (read by the CLI)
     TOPICSLEUTH_JUDGE_MODEL      default claude-opus-4-8  (ANTHROPIC_API_KEY read by the SDK)
     TOPICSLEUTH_EMBEDDING_MODEL  default voyage-4         (VOYAGE_API_KEY read by the SDK)
     TOPICSLEUTH_DECISION_MODEL   default jev-latest       (TYPESAFE_API_KEY; optional)

@@ -6,6 +6,22 @@
 # What the store follows, as a noun phrase the prompts are rendered with.
 domain: the field this store follows
 
+# The prose in the prompts that describes that field. The defaults, in
+# RubricConfig (topicsleuth/rubric.py), describe a feed of papers, release
+# notes and posts about a technical field; set your own here if yours is
+# something else. `topicsleuth show-prompts` prints the result.
+# rubric:
+#   source_kinds: <the kinds of source that arrive, as a list in prose>
+#   evidence_kinds: [<the vocabulary of the item `evidence` field, if your feeder sets one>]
+#   reading_by_kind: <one sentence fragment: how each kind of source bears on a question>
+#   topic_size: <how much evidence a right-sized topic gathers, e.g. "10-50 observations over a year">
+#   question_examples:
+#     - question: <a right-sized question in your field>
+#       subject: <the subject it would be wrong to track instead>
+#   subset_example: <one worked example of the subset_question label>
+#   counter_examples:
+#     - <a decision the judge gets wrong in your field, and the right answer>
+
 embedding:
   dimensions: 1024          # what the store's vector index was built for
 

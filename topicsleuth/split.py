@@ -6,60 +6,16 @@ import re
 from datetime import datetime, timezone
 
 from topicsleuth.interfaces import Embedder, Judge, Store
+from topicsleuth.rubric import (
+    DEFAULT_CONNECTION_TYPE,
+    derive_strength,
+    split_propose_system_prompt,
+    split_reassign_system_prompt,
+)
 from topicsleuth.settings import Settings
 from topicsleuth.synthesize import _sanitize_topic_id
 
 logger = logging.getLogger(__name__)
-
-PROPOSE_SYSTEM_PROMPT = """\
-You are the analyst who maintains a topic store. A topic has grown too broad and \
-needs to be split into more specific sub-topics. You will be given the topic and a summary \
-of its observations. Propose 2-4 more specific sub-topics that collectively cover \
-the same space at a finer granularity.
-
-Each sub-topic should be specific enough to attract 5-15 observations over time, not \
-so broad that it becomes a catch-all. Think of sub-topics as distinct \
-questions or hypotheses within the broader space.
-
-You must respond with ONLY a JSON object (no markdown fencing) containing:
-{
-  "sub_topics": [
-    {
-      "topic_id": "<slug, lowercase with hyphens>",
-      "title": "<concise title>",
-      "summary": "<2-3 sentence description of the specific question tracked>",
-      "tags": ["<relevant tags>"],
-      "suggested_directions": ["<specific open questions>"]
-    }
-  ]
-}
-"""
-
-REASSIGN_SYSTEM_PROMPT = """\
-You are the analyst who maintains a topic store. Observations are being reassigned from a broad \
-parent topic to more specific sub-topics. For each observation, decide which sub-topic \
-it best fits and recalibrate the strength score for the narrower topic.
-
-You must respond with ONLY a JSON array (no markdown fencing) containing one entry \
-per observation:
-[
-  {
-    "item_url": "<url of the original item>",
-    "new_topic_id": "<topic_id of the best-fitting sub-topic>",
-    "new_strength": <float 0-1>,
-    "new_connection_type": "supports" | "extends" | "contradicts" | "shifts",
-    "reasoning": "<brief explanation>"
-  }
-]
-
-Strength calibration:
-- 0.9-1.0: Primary evidence for the sub-topic's core claim.
-- 0.7-0.8: Clear connection, meaningfully extends or supports the sub-topic.
-- 0.5-0.6: Moderate connection, relevant but requires interpretation.
-- 0.3-0.4: Weak signal, tangentially related.
-
-Every observation must appear exactly once. Do not drop any.
-"""
 
 # Maximum observations per reassignment batch
 REASSIGN_BATCH_SIZE = 20
@@ -95,13 +51,13 @@ def split_topic(
     )
 
     # 2. Phase 1: Propose sub-topics
-    sub_topics = _propose_sub_topics(topic, observations, judge)
+    sub_topics = _propose_sub_topics(topic, observations, judge, settings)
     logger.info("Proposed %d sub-topics", len(sub_topics))
     for st in sub_topics:
         logger.info("  - %s: %s", st["topic_id"], st["title"])
 
     # 3. Phase 2: Reassign observations in batches
-    reassignments = _reassign_observations(topic, observations, sub_topics, judge)
+    reassignments = _reassign_observations(topic, observations, sub_topics, judge, settings)
 
     # Validate all observations are reassigned
     obs_urls = {obs["item_url"] for obs in observations}
@@ -155,17 +111,19 @@ def split_topic(
             continue
 
         new_topic_id = _sanitize_topic_id(r["new_topic_id"])
+        derived = derive_strength(r.get("fit_questions"))
         obs_doc = {
             "item_id": original_obs.get("item_id"),
             "item_url": r["item_url"],
             "item_title": original_obs.get("item_title", ""),
             "topic_id": new_topic_id,
             "date": now,
-            "strength": r.get("new_strength", original_obs.get("strength", 0.5)),
+            "strength": derived if derived is not None else original_obs.get("strength", 0.5),
             "connection_type": r.get(
                 "new_connection_type",
-                original_obs.get("connection_type", "supports"),
+                original_obs.get("connection_type", DEFAULT_CONNECTION_TYPE),
             ),
+            "fit_questions": r.get("fit_questions"),
             "reasoning_trace": r.get("reasoning", ""),
             "source_name": original_obs.get("source_name", ""),
             "source_type": original_obs.get("source_type", ""),
@@ -208,8 +166,9 @@ def _propose_sub_topics(
     topic: dict,
     observations: list[dict],
     judge: Judge,
+    settings: Settings,
 ) -> list[dict]:
-    """Phase 1: Ask the LLM to propose sub-topics based on observation titles."""
+    """Phase 1: Ask the judge to propose sub-topics based on observation titles."""
     # Use titles only to keep the prompt compact
     obs_summary = "\n".join(
         f"- {obs.get('item_title', 'N/A')} (strength: {obs.get('strength', 'N/A')}, "
@@ -227,7 +186,7 @@ def _propose_sub_topics(
         f"{obs_summary}"
     )
 
-    completion = judge.complete(PROPOSE_SYSTEM_PROMPT, user_content, max_tokens=2048)
+    completion = judge.complete(split_propose_system_prompt(settings), user_content, max_tokens=2048)
     parsed = _parse_json_response(completion.text)
     return parsed["sub_topics"]
 
@@ -237,8 +196,10 @@ def _reassign_observations(
     observations: list[dict],
     sub_topics: list[dict],
     judge: Judge,
+    settings: Settings,
 ) -> list[dict]:
-    """Phase 2: Reassign observations to sub-topics in batches."""
+    """Phase 2: Reassign observations to sub-topics in batches. The judge
+    answers the fit questions per observation; strength is derived here."""
     # Format sub-topics for the prompt
     sub_topic_text = "\n".join(
         f"- topic_id: {st['topic_id']}\n"
@@ -277,7 +238,7 @@ def _reassign_observations(
             + "\n\n".join(obs_lines)
         )
 
-        completion = judge.complete(REASSIGN_SYSTEM_PROMPT, user_content, max_tokens=4096)
+        completion = judge.complete(split_reassign_system_prompt(settings), user_content, max_tokens=4096)
         batch_result = _parse_json_response(completion.text)
         # Response is a JSON array
         if isinstance(batch_result, list):

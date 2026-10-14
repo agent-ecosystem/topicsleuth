@@ -6,7 +6,6 @@
  "sample_query": null,
  "replay_from": null,
  "label": "example",
- "leave_one_out": true,
  "topic_universe": 12,
  "config": {
   "model": "example-judge",

@@ -20,41 +20,10 @@ import re
 from datetime import datetime, timezone
 
 from topicsleuth.interfaces import Embedder, Judge, Store
+from topicsleuth.rubric import merge_system_prompt
 from topicsleuth.settings import Settings
 
 logger = logging.getLogger(__name__)
-
-MERGE_SYSTEM_PROMPT = """\
-You are the analyst who maintains a topic store. Two topics have been \
-identified as near-duplicates and are being merged into one surviving topic. \
-You will see both topics (titles, summaries, representative observations) \
-and your job is to write a unified title, summary, tag set, and suggested \
-directions for the merged topic.
-
-The merged topic should:
-- Track a single specifiable question that both source topics were \
-following from slightly different angles.
-- Be no broader than the union of the two source topics. Do not pull in \
-adjacent territory.
-- Have a one-sentence summary that names what is being investigated, not \
-just the subject area.
-- Have a tag set that is the union of both source tag sets, deduplicated.
-- Have suggested directions that capture the most useful open questions \
-from both source topics, deduplicated.
-
-You must respond with ONLY a JSON object (no markdown fencing):
-{
-  "title": "<concise title for the merged topic>",
-  "summary": "<one sentence naming what is being investigated>",
-  "tags": ["<deduplicated union of both source tag sets>"],
-  "suggested_directions": ["<deduplicated useful directions from both>"],
-  "rationale": "<one or two sentences explaining what the merged topic captures and what was preserved>"
-}
-
-The topic_id of the surviving topic is fixed by the caller; do not propose \
-a new topic_id.
-"""
-
 
 def suggest_merges(
     store: Store,
@@ -139,7 +108,8 @@ def merge_topics(
     """Merge a source topic into a target topic.
 
     The source topic is retired (status=retired, merged_into=<target_id>).
-    Its observations have their topic_id updated to the target. The target's
+    Its observations are moved onto the target, each keeping where it came
+    from (moved_from, and a note in its reasoning trace). The target's
     title, summary, tags, and suggested_directions are rewritten by the LLM,
     and its embedding is recomputed from the new title+summary.
 
@@ -175,7 +145,7 @@ def merge_topics(
     )
 
     merged_description = _propose_merged_description(
-        source, target, source_obs, target_obs, judge
+        source, target, source_obs, target_obs, judge, settings
     )
 
     if dry_run:
@@ -216,12 +186,17 @@ def merge_topics(
     })
     logger.info("Updated target topic: %s", target_topic_id)
 
-    reassigned = store.reassign_observations(
-        source_topic_id, target_topic_id
+    from topicsleuth.add_topic import move_observations
+
+    # Moves every entry with provenance and re-snapshots both topics; the
+    # source is retired here rather than by the helper so merged_into is
+    # set even when the source had no observations.
+    move_observations(
+        store, source_obs, target_topic_id, now, reason="merge", retire_empty_sources=False
     )
     logger.info(
-        "Reassigned %d observations from %s to %s",
-        reassigned, source_topic_id, target_topic_id,
+        "Moved %d observations from %s to %s",
+        len(source_obs), source_topic_id, target_topic_id,
     )
 
     store.update_topic(source_topic_id, {
@@ -231,18 +206,13 @@ def merge_topics(
     })
     logger.info("Retired source topic: %s", source_topic_id)
 
-    from topicsleuth.record import _compute_snapshot
-
-    snapshot = _compute_snapshot(store, target_topic_id, now)
-    store.append_snapshot(target_topic_id, snapshot)
-
     return {
         "dry_run": False,
         "source_topic_id": source_topic_id,
         "target_topic_id": target_topic_id,
         "merged_title": new_title,
         "merged_summary": new_summary,
-        "observations_reassigned": reassigned,
+        "observations_reassigned": len(source_obs),
         "target_observation_count_after": len(source_obs) + len(target_obs),
     }
 
@@ -282,6 +252,7 @@ def _propose_merged_description(
     source_obs: list[dict],
     target_obs: list[dict],
     judge: Judge,
+    settings: Settings,
 ) -> dict:
     user_content = (
         _format_topic_for_merge(source, source_obs, "Source Topic (will be retired)")
@@ -289,7 +260,7 @@ def _propose_merged_description(
         + _format_topic_for_merge(target, target_obs, "Target Topic (will absorb)")
     )
 
-    completion = judge.complete(MERGE_SYSTEM_PROMPT, user_content, max_tokens=2048)
+    completion = judge.complete(merge_system_prompt(settings), user_content, max_tokens=2048)
     return _parse_json_response(completion.text)
 
 

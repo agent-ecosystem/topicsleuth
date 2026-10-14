@@ -55,8 +55,27 @@ def test_help_lists_commands(capsys, env):
     code, out = run(capsys, "--help")
     assert code == 0
     for cmd in ("seed", "clean", "split-topic", "merge-topics", "suggest-merges", "reprocess-tail",
-                "add-topic", "move-observation", "audit", "backfill-embeddings", "tune"):
+                "add-topic", "move-observation", "audit", "backfill-embeddings", "tune", "show-prompts"):
         assert cmd in out
+
+
+def test_settings_file_from_the_environment_reaches_the_prompts(capsys, env, monkeypatch):
+    (env / "settings.yaml").write_text(
+        "domain: municipal housing policy\n"
+        "rubric:\n"
+        "  source_kinds: council minutes, local news, planning filings\n"
+        "  question_examples:\n"
+        "    - question: Are cities loosening parking minimums near transit?\n"
+        "      subject: parking\n"
+    )
+    monkeypatch.setenv("TOPICSLEUTH_SETTINGS", "settings.yaml")
+    code, out = run(capsys, "show-prompts", "confirm")
+    assert code == 0
+    assert "municipal housing policy" in out and "council minutes, local news, planning filings" in out
+    assert '"Are cities loosening parking minimums near transit?" is a question a topic can track. "parking" is a subject.' in out
+    assert "harness vendors" not in out
+    code, out = run(capsys, "show-prompts")
+    assert code == 0 and out.count("=" * 70) == 12 and "split_reassign" in out
 
 
 def test_missing_store_configuration_is_a_clean_error(capsys, env, monkeypatch):
@@ -67,12 +86,17 @@ def test_missing_store_configuration_is_a_clean_error(capsys, env, monkeypatch):
 
 def test_seed_and_audit(capsys, env):
     (env / "topics.yaml").write_text("topics:\n  - title: Topic A\n    summary: Tracks A.\n    tags: [alpha]\n")
+    code, out = run(capsys, "seed", "topics.yaml", "--dry-run")
+    assert code == 0 and "[DRY RUN] would embed and write 1 topics" in out and "topic-a" in out
+    assert fake.shared("store").list_topics() == []
     code, out = run(capsys, "seed", "topics.yaml")
     assert code == 0 and "Seeded 1 topics" in out
     st = fake.shared("store")
     assert len(st.get_topic("topic-a")["embedding"]) == DIM
     code, out = run(capsys, "seed", "topics.yaml")
     assert "already has data" in out
+    code, out = run(capsys, "seed", "topics.yaml", "--dry-run")
+    assert "already holds 1 topics" in out
     code, out = run(capsys, "audit", "--label", "x")
     assert code == 0 and "Total: 1" in out and (env / "tuning_runs" / "audit-x.md").exists()
     (env / "empty.yaml").write_text("topics: []\n")
@@ -81,6 +105,9 @@ def test_seed_and_audit(capsys, env):
 
 def test_clean_removes_recent_store_output(capsys, env):
     seeded()
+    code, out = run(capsys, "clean", "--hours", "1", "--dry-run")
+    assert code == 0 and "[DRY RUN]" in out and "topics_deleted           2" in out and "observations_deleted     4" in out
+    assert len(fake.shared("store").list_topics()) == 2
     code, out = run(capsys, "clean", "--hours", "1")
     assert code == 0 and "topics_deleted" in out and fake.shared("store").list_topics() == []
 
@@ -157,9 +184,9 @@ def test_tune_replays_a_prior_report(capsys, env):
                                 "topic_id": "a", "connection_type": "supports",
                                 "fit_questions": {"q1_scope_expansion": True, "q2_representative_citation": True, "q3_distinguishing_evidence": True},
                                 "reasoning_trace": "r"})
-    code, out = run(capsys, "tune", "synthesize", "--replay", "prior.json", "--leave-one-out", "--label", "t", "--limit", "3", "--model", "m2")
+    code, out = run(capsys, "tune", "synthesize", "--replay", "prior.json", "--label", "t", "--limit", "3", "--model", "m2")
     assert code == 0 and "link_existing     1" in out and "report:" in out
     report = json.loads((env / "tuning_runs" / "synthesize-t-replay.json").read_text())
-    assert report["config"]["model"] == "m2" and report["config"]["candidates"]["vector_limit"] == 3 and report["leave_one_out"] is True
+    assert report["config"]["model"] == "m2" and report["config"]["candidates"]["vector_limit"] == 3 and "leave_one_out" not in report
     code, out = run(capsys, "tune", "synthesize")
     assert code != 0 and "needs --replay" in str(code)

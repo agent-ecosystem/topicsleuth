@@ -111,9 +111,8 @@ def test_observations(store):
     store.update_observation(oid, {"strength": 0.9})
     assert store.get_observations_for_item("u1")[0]["strength"] == 0.9
     assert len(store.list_observations()) == 2
-    assert store.reassign_observations("a", "b") == 2
-    assert store.count_observations_for_topic("b") == 2 and store.count_observations_for_topic("a") == 0
-    assert store.delete_observations_for_topic("b") == 2
+    assert store.delete_observations_for_topic("a") == 2
+    assert store.count_observations_for_topic("a") == 0
 
 
 def test_weak_topics(store):

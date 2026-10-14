@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 from datetime import datetime, timedelta, timezone
@@ -20,8 +21,14 @@ from topicsleuth.env import backends_from_env
 from topicsleuth.settings import load_settings
 
 
+def _settings():
+    """Packaged defaults, with the operator's settings file layered on top
+    when TOPICSLEUTH_SETTINGS names one."""
+    return load_settings(os.environ.get("TOPICSLEUTH_SETTINGS") or None)
+
+
 def _backends(need_judge: bool = False, need_embedder: bool = False):
-    settings = load_settings()
+    settings = _settings()
     try:
         return settings, backends_from_env(settings, need_judge=need_judge, need_embedder=need_embedder)
     except (RuntimeError, ImportError) as e:
@@ -35,7 +42,7 @@ def cmd_seed(args):
     if not seed_topics:
         print(f"No seed topics defined in {args.definitions}")
         return
-    settings, b = _backends(need_embedder=True)
+    settings, b = _backends(need_embedder=not args.dry_run)
 
     topic_docs = []
     for st in seed_topics:
@@ -45,8 +52,20 @@ def cmd_seed(args):
             "summary": st.summary,
             "tags": st.tags,
             "suggested_directions": st.suggested_directions,
-            "embedding": b.embedder.embed_documents([f"{st.title}\n\n{st.summary}"])[0],
         })
+
+    if args.dry_run:
+        for doc in topic_docs:
+            print(f"  {doc['topic_id']:<45} {doc['title']}")
+        existing = len(b.store.list_topics())
+        if existing:
+            print(f"\n[DRY RUN] store already holds {existing} topics; seed writes only to an empty store.")
+        else:
+            print(f"\n[DRY RUN] would embed and write {len(topic_docs)} topics.")
+        return
+
+    for doc, st in zip(topic_docs, seed_topics):
+        doc["embedding"] = b.embedder.embed_documents([f"{st.title}\n\n{st.summary}"])[0]
 
     inserted = b.store.seed_topics_if_empty(topic_docs)
     if inserted:
@@ -55,9 +74,28 @@ def cmd_seed(args):
         print("Topics collection already has data, skipping seed.")
 
 
+def _preview_delete_since(store, cutoff: datetime) -> dict:
+    """What Store.delete_since would remove, counted through the read side
+    of the protocol so no adapter needs a second method for it."""
+    obs = sum(1 for o in store.list_observations() if o.get("date") and o["date"] >= cutoff)
+    topics = snapshots = 0
+    for t in store.list_topics():
+        if t.get("date_identified") and t["date_identified"] >= cutoff:
+            topics += 1
+        else:
+            snapshots += sum(1 for s in t.get("snapshots", []) if s.get("date") and s["date"] >= cutoff)
+    return {"observations_deleted": obs, "topics_deleted": topics, "snapshots_cleared": snapshots}
+
+
 def cmd_clean(args):
     settings, b = _backends()
     cutoff = datetime.now(timezone.utc) - timedelta(hours=args.hours)
+    if args.dry_run:
+        result = _preview_delete_since(b.store, cutoff)
+        print(f"[DRY RUN] would remove store output from the last {args.hours}h:")
+        for k, v in result.items():
+            print(f"  {k:<24} {v}")
+        return
     result = b.store.delete_since(cutoff)
     print(f"Removed store output from the last {args.hours}h:")
     for k, v in result.items():
@@ -362,6 +400,19 @@ def cmd_backfill_embeddings(args):
     )
 
 
+def cmd_show_prompts(args):
+    from topicsleuth.rubric import PROMPTS
+
+    settings = _settings()
+    names = [args.name] if args.name else list(PROMPTS)
+    for i, name in enumerate(names):
+        if i:
+            print()
+        if len(names) > 1:
+            print(f"{'=' * 70}\n{name}\n{'=' * 70}")
+        print(PROMPTS[name](settings))
+
+
 def cmd_tune(args):
     from topicsleuth.tune import replay_synthesis
 
@@ -398,7 +449,6 @@ def cmd_tune(args):
         settings=settings,
         replay_from=Path(args.replay) if args.replay else None,
         label=args.label,
-        leave_one_out=args.leave_one_out,
     )
 
 
@@ -424,6 +474,7 @@ def main():
     seed_parser.add_argument(
         "definitions", help="YAML file with a topics: list (title, summary, tags, suggested_directions)"
     )
+    seed_parser.add_argument("--dry-run", action="store_true", help="List the topics that would be written, without embedding or writing")
     seed_parser.set_defaults(func=cmd_seed)
 
     clean_parser = subparsers.add_parser(
@@ -433,6 +484,7 @@ def main():
         "--hours", type=float, default=28,
         help="Remove store output created within this many hours (default: 28)"
     )
+    clean_parser.add_argument("--dry-run", action="store_true", help="Count what would be removed without removing it")
     clean_parser.set_defaults(func=cmd_clean)
 
     split_parser = subparsers.add_parser(
@@ -523,10 +575,17 @@ def main():
     tune_parser.add_argument("--confirm-backend", choices=["judge", "decision"], default=None, help="Which reviewer checks propose_new decisions (default: settings.yaml)")
     tune_parser.add_argument("--confirm-threshold", type=float, default=None, help="decision backend: p(belongs) needed to demote a proposal")
     tune_parser.add_argument("--no-confirm", action="store_true", help="Disable the second-pass confirmation of propose_new decisions")
-    tune_parser.add_argument("--leave-one-out", action="store_true",
-                             help="Hide each replayed item's own singleton topic and its own title from candidates")
     tune_parser.add_argument("--ignore-tags", type=str, default=None, help="Comma-separated tags excluded from overlap matching")
     tune_parser.set_defaults(func=cmd_tune)
+
+    from topicsleuth.rubric import PROMPTS
+    prompts_parser = subparsers.add_parser(
+        "show-prompts",
+        help="Print the judge prompts as rendered with the current settings (domain and rubric)",
+    )
+    prompts_parser.add_argument("name", nargs="?", choices=list(PROMPTS), default=None,
+                                help="One prompt; default: all of them")
+    prompts_parser.set_defaults(func=cmd_show_prompts)
 
     args = parser.parse_args()
 

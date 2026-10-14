@@ -139,14 +139,6 @@ class MemoryStore:
             del self.observations[k]
         return len(doomed)
 
-    def reassign_observations(self, source_topic_id: str, target_topic_id: str) -> int:
-        n = 0
-        for o in self.observations.values():
-            if o.get("topic_id") == source_topic_id:
-                o["topic_id"] = target_topic_id
-                n += 1
-        return n
-
     # ── item embeddings ──
     def save_item_embedding(self, item_url: str, embedding: list[float]) -> None:
         self.item_embeddings[item_url] = list(embedding)

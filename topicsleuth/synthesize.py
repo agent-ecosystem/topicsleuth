@@ -8,12 +8,16 @@ from dataclasses import asdict, dataclass
 
 from topicsleuth.interfaces import DecisionModel, Embedder, Judge, Store
 from topicsleuth.settings import Settings
-
-
-def render_prompt(template: str, settings: Settings) -> str:
-    """Fill the one placeholder the prompts carry: the domain the store
-    follows. Plain replacement, since the templates contain JSON braces."""
-    return template.replace("{domain}", settings.domain)
+from topicsleuth.rubric import (
+    CONFIRM_LINK_STRENGTH,
+    DEFAULT_CONNECTION_TYPE,
+    GATE_OVERRIDE_DEFAULT_STRENGTH,
+    REVIEWER_CONNECTION_TYPE,
+    derive_strength,
+    cold_start_system_prompt,
+    confirm_system_prompt,
+    synthesize_system_prompt,
+)
 
 
 class ItemEval(Protocol):
@@ -29,346 +33,6 @@ class ItemEval(Protocol):
     above_threshold: bool
 
 logger = logging.getLogger(__name__)
-
-SYNTHESIZE_SYSTEM_PROMPT = """\
-You are the analyst who maintains a topic store that follows {domain}. \
-Items arrive from every kind of source: papers, release notes, blog posts, \
-discussion threads, tutorials. Given a new item and candidate topics it might \
-relate to, decide how to connect them.
-
-## What a right-sized topic is
-
-A topic tracks one question over time, not a subject area. A right-sized topic:
-- Names a single specifiable question that distinct items can each bear on \
-from different angles. ("How do agents fail in ways static analysis misses?" \
-is a question a topic can track. "Agent failures" is a subject. "Are harness \
-vendors sandboxing agent tool execution by default?" is a question; \
-"sandboxing" is a subject.)
-- Could plausibly accumulate 10-50 observations over a year without becoming \
-incoherent.
-- Is narrower than a subfield but broader than a single technique, product, \
-or release.
-
-## Reading the item by its kind
-
-The item carries its source type and may carry an evidence kind (`proposes`, \
-`measures`, `argues`, `ships`, `uses`) and tags from its feeder. Read the \
-item for what it is: a paper bears on a question \
-by proposing or measuring something, a release note by showing that something \
-shipped, a tutorial or usage report by showing something in practice, an \
-opinion piece by arguing a position. The question is the same across kinds. \
-A release and a paper on the same question belong on the same topic; that \
-convergence is the point of the store. Kind never decides the link: do not \
-propose a separate topic for the practice side of a question an existing \
-topic already tracks, and do not fold a different question into a topic \
-because both mention the same product or vendor.
-
-A topic that absorbs every loosely-related item becomes a catch-all. A topic \
-spawned for every novel angle creates redundant siblings. The two failures are \
-symmetric; both are wrong.
-
-## Step 1: Classify each candidate
-
-For each candidate topic provided, choose the relationship label that best \
-describes how the item relates to that topic. The labels are descriptive, not \
-evaluative — they name a structural relationship, not a quality judgment.
-
-- `same_question` — The candidate's question is the question this item \
-bears on. The item's primary contribution is an answer, a partial answer, or \
-a new piece of evidence for that question.
-
-- `subset_question` — The item bears on a specific instance of the \
-candidate's question. The candidate's question subsumes what the item is \
-about. (Example: candidate asks "how do agents fail in ways static analysis \
-misses?"; item proposes a detection method for one specific failure class, \
-or ships a tool that catches one. The item is a subset, not a different \
-question.)
-
-- `adjacent_question` — The item bears on a different question in the same \
-domain or subfield as the candidate. The candidate's summary does not \
-actually cover what the item is about, even though they share keywords.
-
-- `surface_overlap` — The item shares tags, model names, products, or \
-subfield with the candidate, but its question lies elsewhere.
-
-For each candidate, state the candidate's question and the item's question \
-in one phrase each, then pick the label.
-
-When candidates include `representative observations`, use those to ground your \
-classification. The candidate's one-sentence summary describes the topic \
-abstractly; the representative observations show what the topic actually \
-contains. If the new item resembles those observations in question — not \
-just subject — that is strong evidence for `same_question` or \
-`subset_question`, even if the summary is phrased more generally than the \
-item's specific contribution, and even if the observations are papers and \
-the item is a release, or the reverse.
-
-## Step 2: Decide
-
-Apply these rules in order. Do not skip ahead.
-
-1. If any candidate is `same_question`, link_existing to it. If multiple, \
-pick the one with the most evidence (convergence beats fragmentation).
-2. Else if any candidate is `subset_question`, link_existing to it. \
-Subset_question is the right home for items that are specific instances of an \
-existing direction; this is not a reason to spawn a more specific sibling.
-3. Else (all candidates are `adjacent_question` or `surface_overlap`):
-   - If the item bears on a question that is itself right-sized (per the \
-rubric above) and is genuinely distinct from every adjacent candidate's \
-question, propose_new.
-   - Otherwise skip. An above-threshold item that does not link and does not \
-warrant a new topic is a valid outcome, not a failure mode.
-
-## Step 3: Strength assessment (link_existing only)
-
-Do not produce a strength number directly. Answer three independent yes/no \
-questions about the item-topic relationship. The questions describe \
-structural properties, not quality.
-
-- `q1_scope_expansion`: Would the topic's one-sentence summary need to expand \
-or be rewritten to incorporate this item's contribution? (yes if the item \
-broadens what the topic covers; no if the existing summary already describes \
-what this item investigates.)
-
-- `q2_representative_citation`: If someone were writing a one-page summary \
-of this topic and citing 5 representative items, would this item plausibly \
-be in that list? (yes if the item is among the kind of work that \
-characterizes the topic; no if it is one of many similar items that wouldn't \
-make the cut.)
-
-- `q3_distinguishing_evidence`: Does the item contribute evidence that \
-distinguishes the topic's claim from alternative explanations or competing \
-positions? (yes if the item helps adjudicate a question about the topic; no \
-if it adds another data point consistent with what's already established.)
-
-The strength score is computed from these answers downstream — you do not \
-emit it. Answer the three questions honestly; do not work backward from a \
-target strength.
-
-## Step 4: Connection type (link_existing only)
-
-- `supports` — adds evidence consistent with the topic's claim. This is the \
-default for most links.
-- `extends` — broadens the topic's scope (use only when q1_scope_expansion is \
-yes).
-- `contradicts` — provides evidence against the topic's claim.
-- `shifts` — marks a change in the topic's trajectory or status.
-
-## Survey papers and comprehensive overviews
-
-A common failure mode is to treat a survey paper, a "state of X" post, or a \
-launch roundup as broader than every candidate and propose a "comprehensive \
-X" meta-topic. Do not do this. A survey or overview is a subset of every \
-topic it covers, not a superset. The question of a survey is whichever \
-subset_question candidate the survey most centrally treats. If multiple candidates are subset matches, \
-link to the one with the most evidence (the survey is then a strong piece of \
-representative evidence for that topic). Meta-topics like "comprehensive \
-agent memory systems" produce catch-alls and should be avoided.
-
-## Counter-examples worth holding in mind
-
-- An above-threshold paper proposing a benchmark for prompt engineering, with \
-no candidates rated `same_question` or `subset_question`, where the candidates \
-are all adjacent: the right answer is `skip` if no genuinely new \
-right-sized topic is in the paper, not `propose_new`.
-
-- A paper on agentic post-training, judged against an existing topic \
-"Training Paradigms for Agentic Code Models" rated `subset_question`: the \
-right answer is `link_existing`. Even if the paper has its own narrative \
-angle, it is a specific instance of the candidate's question. The strength \
-questions then determine score; typically Q1=no (summary covers it), Q2=yes \
-(citable), Q3 depends on whether it adjudicates anything.
-
-- A paper proposing a new failure detection method, judged against \
-"Agent Failure Mode Detection" rated `same_question`: link_existing. Q1 \
-likely no, Q2 yes, Q3 yes if the method is genuinely novel rather than \
-incremental — strength ends up in the upper band.
-
-- A paper on RL training that briefly observes some agent failures, judged \
-against "Agent Failure Mode Detection" rated `surface_overlap` (the \
-question is RL training, failures are incidental): do not link, even at low \
-strength. Either link to a training-topic candidate or skip.
-
-- A changelog entry from a harness vendor adding sandboxed tool execution, \
-judged against "Are harness vendors sandboxing agent tool execution by \
-default?" rated `same_question`: link_existing with `supports`, or `shifts` \
-if it is the first vendor to make it the default. The item being a release \
-rather than a paper changes nothing about the link.
-
-- A product announcement that merely mentions agents, with candidates all \
-rated `surface_overlap`, and no right-sized question of its own: skip. A \
-topic per product is a catch-all in waiting.
-
-## Response format
-
-Respond with ONLY a JSON object (no markdown fencing):
-{
-  "candidate_classifications": [
-    {
-      "topic_id": "<id>",
-      "candidate_question": "<one phrase: the question this candidate tracks>",
-      "item_question": "<one phrase: the question this item bears on>",
-      "label": "same_question" | "subset_question" | "adjacent_question" | "surface_overlap"
-    }
-  ],
-  "decision": "link_existing" | "propose_new" | "skip",
-  "topic_id": "<existing topic_id if link_existing, null otherwise>",
-  "connection_type": "supports" | "extends" | "contradicts" | "shifts" | null,
-  "fit_questions": {
-    "q1_scope_expansion": <bool>,
-    "q2_representative_citation": <bool>,
-    "q3_distinguishing_evidence": <bool>
-  },
-  "reasoning_trace": "<short explanation of the decision>",
-  "new_topic": {
-    "title": "<if propose_new>",
-    "summary": "<one sentence naming what is being investigated>",
-    "topic_id": "<slug>",
-    "tags": ["<...>"],
-    "suggested_directions": ["<...>"],
-    "scope_test_question": "<the single question this topic would track>",
-    "differentiation_from_closest": "<closest candidate topic_id and the concrete claim that makes this distinct>"
-  }
-}
-
-Include all evaluated candidates in candidate_classifications (typically the \
-top 5 by apparent relevance). Provide fit_questions only when decision is \
-link_existing; omit or set to null otherwise. Provide new_topic only when \
-decision is propose_new.
-"""
-
-COLD_START_SYSTEM_PROMPT = """\
-You are the analyst who maintains a topic store that follows {domain}. \
-There are currently no established topics. Evaluate whether this item \
-suggests a question worth tracking over time.
-
-If recently proposed topics from this batch are listed below, classify the \
-item against each using the same labels described in Step 1, and apply the \
-same decision rules. Otherwise, the choice is between propose_new and skip.
-
-## What a right-sized topic is
-
-A topic tracks one question over time, not a subject area. A right-sized topic:
-- Names a single specifiable question that distinct items (papers, releases, \
-posts, discussions) can each bear on from different angles.
-- Could plausibly accumulate 10-50 observations over a year.
-- Is narrower than a subfield but broader than a single technique, product, \
-or release.
-
-## Step 1: Classify each batch-proposed candidate
-
-For each candidate (if any), pick the relationship label:
-- `same_question` — candidate's question is what this item bears on.
-- `subset_question` — item is a specific instance of candidate's question.
-- `adjacent_question` — different question, same domain.
-- `surface_overlap` — shared keywords, different question.
-
-## Step 2: Decide
-
-- If any candidate is `same_question` or `subset_question`, link_existing.
-- Else if the item bears on a right-sized question genuinely distinct from \
-any adjacent candidate, propose_new.
-- Else skip.
-
-## Step 3: Strength (only if link_existing)
-
-Answer three yes/no questions:
-- `q1_scope_expansion`: Would the candidate's summary need to expand to \
-incorporate this item?
-- `q2_representative_citation`: Would this item plausibly be in a 5-item \
-representative citation list for the candidate's topic?
-- `q3_distinguishing_evidence`: Does the item adjudicate the candidate's \
-claim against alternatives, beyond just adding a data point?
-
-The strength score is computed from these downstream.
-
-## Response format
-
-Respond with ONLY a JSON object (no markdown fencing):
-{
-  "candidate_classifications": [
-    { "topic_id": "<id>", "candidate_question": "<one phrase>", "item_question": "<one phrase>",
-      "label": "same_question" | "subset_question" | "adjacent_question" | "surface_overlap" }
-  ],
-  "decision": "propose_new" | "link_existing" | "skip",
-  "topic_id": "<existing topic_id if link_existing, null otherwise>",
-  "connection_type": "supports" | "extends" | "contradicts" | "shifts" | null,
-  "fit_questions": {
-    "q1_scope_expansion": <bool>,
-    "q2_representative_citation": <bool>,
-    "q3_distinguishing_evidence": <bool>
-  },
-  "reasoning_trace": "<short explanation>",
-  "new_topic": {
-    "title": "<if propose_new>",
-    "summary": "<one sentence naming what is being investigated>",
-    "topic_id": "<slug>",
-    "tags": ["<...>"],
-    "suggested_directions": ["<...>"],
-    "scope_test_question": "<the question this topic would track>",
-    "differentiation_from_closest": "<closest candidate topic_id and concrete distinguishing claim, or 'none' if no candidates>"
-  }
-}
-"""
-
-
-CONFIRM_SYSTEM_PROMPT = """\
-You are a second, independent reviewer for a topic store that follows \
-{domain}. Items are papers, release notes, posts, discussion threads and \
-tutorials; a topic tracks one question across all of them. A first-pass analyst decided that a new item does not fit any \
-existing topic and proposed a new topic for it. Your job is to check \
-that call. You see the item, the closest existing topics, and the proposed \
-topic.
-
-## Why this check exists
-
-The two possible mistakes are not symmetric. Linking an item to an existing \
-topic that only partly covers it costs one slightly noisy observation, and the \
-topic's summary can later be broadened. Creating a topic that should have been \
-a facet of an existing one creates a permanent near-duplicate that splits \
-future evidence. Two thirds of newly created topics never receive a second \
-observation. So the bar for a new topic is higher than "the item's question \
-differs from every candidate's question".
-
-## The test
-
-A new topic is warranted only if BOTH hold:
-
-1. No candidate is the same *question* viewed from a different facet. Ask, \
-for the closest candidate: if that topic's one-sentence summary were \
-broadened by a clause, would it naturally cover this item? If yes, the item \
-is an extension of that topic, not a new question. Different method, \
-different artifact type, different source kind (a release where the topic \
-holds papers, or the reverse), different subdomain, or a narrower instance \
-are all facets, not new questions.
-
-2. The proposed topic is right-sized on its own: it names one specifiable \
-question that other, different items are likely to bear on, and it could \
-plausibly accumulate 10-50 observations over a year. A topic that restates \
-this one item's contribution, or that is one product's changelog under \
-another name, fails this test.
-
-If (1) fails: `link_existing` to that candidate with connection_type \
-`extends`. If (1) holds but (2) fails: `skip`. Skip is a normal outcome for \
-an above-threshold item that is interesting but not a direction. If both \
-hold: `confirm_new`.
-
-You do not assess link strength. A link made here is by construction an \
-edge extension of the topic and is scored as such downstream.
-
-## Response format
-
-Respond with ONLY a JSON object (no markdown fencing):
-{
-  "verdict": "confirm_new" | "link_existing" | "skip",
-  "topic_id": "<candidate topic_id if link_existing, else null>",
-  "connection_type": "extends" | "supports" | null,
-  "closest_candidate": "<topic_id of the closest candidate regardless of verdict>",
-  "broadened_summary": "<if link_existing: the candidate summary with the clause that covers this item; else null>",
-  "reasoning": "<two or three sentences>"
-}
-"""
-
 
 @dataclass
 class SynthesisDecision:
@@ -687,9 +351,6 @@ def _robust_json_parse(raw_text: str) -> dict:
     )
 
 
-GATE_OVERRIDE_DEFAULT_STRENGTH = 0.65
-
-
 def _enforce_link_gate(parsed: dict, all_candidates: list[dict]) -> dict:
     """Mechanical override of propose_new when candidates include strong fits.
 
@@ -754,7 +415,7 @@ def _enforce_link_gate(parsed: dict, all_candidates: list[dict]) -> dict:
     )
     parsed["decision"] = "link_existing"
     parsed["topic_id"] = target_id
-    parsed["connection_type"] = "supports"
+    parsed["connection_type"] = DEFAULT_CONNECTION_TYPE
     parsed["strength"] = GATE_OVERRIDE_DEFAULT_STRENGTH
     parsed["new_topic"] = None
     parsed["reasoning_trace"] = (parsed.get("reasoning_trace", "") or "") + note
@@ -805,17 +466,6 @@ def _confirmation_candidates(
     return chosen
 
 
-# Strength assigned to every link made by the confirmation pass. The reviewer
-# is not asked the fit questions: having just argued that the item belongs,
-# it answered yes to all three nearly every time (0.95) in tuning runs, which
-# is agreement with itself, not calibration. What these links are is known
-# by construction: an item the first pass judged distinct enough to want its
-# own topic, pulled back as an edge extension. That is real scope evidence,
-# so it stays above the 0.7 minor floor, but it should not outrank a topic's
-# core observations (0.80/0.95) when representative examples are chosen.
-CONFIRM_LINK_STRENGTH = 0.70
-
-
 def _apply_confirmation(parsed: dict, confirm: dict, candidate_ids: set[str]) -> dict:
     """Fold the confirmation verdict into the first-pass decision.
 
@@ -835,7 +485,7 @@ def _apply_confirmation(parsed: dict, confirm: dict, candidate_ids: set[str]) ->
         if target in candidate_ids:
             parsed["decision"] = "link_existing"
             parsed["topic_id"] = target
-            parsed["connection_type"] = confirm.get("connection_type") or "extends"
+            parsed["connection_type"] = confirm.get("connection_type") or REVIEWER_CONNECTION_TYPE
             parsed["strength"] = CONFIRM_LINK_STRENGTH
             parsed["fit_questions"] = None
             parsed["new_topic"] = None
@@ -902,7 +552,7 @@ def _apply_decision_confirmation(parsed: dict, scores: list[dict], threshold: fl
     if best["link_probability"] >= threshold:
         parsed["decision"] = "link_existing"
         parsed["topic_id"] = best["topic_id"]
-        parsed["connection_type"] = "extends"
+        parsed["connection_type"] = REVIEWER_CONNECTION_TYPE
         parsed["strength"] = CONFIRM_LINK_STRENGTH
         parsed["fit_questions"] = None
         parsed["new_topic"] = None
@@ -979,7 +629,7 @@ def _confirm_proposal(
         f"## Proposed new topic (first pass)\n"
         f"{_format_proposed_topic(parsed.get('new_topic') or {})}"
     )
-    response = judge.complete(render_prompt(CONFIRM_SYSTEM_PROMPT, settings), user_content, max_tokens=1024)
+    response = judge.complete(confirm_system_prompt(settings), user_content, max_tokens=1024)
     try:
         confirm = _robust_json_parse(response.text)
     except json.JSONDecodeError:
@@ -987,41 +637,6 @@ def _confirm_proposal(
         confirm = {"verdict": "confirm_new", "reasoning": "(unparseable reviewer response)"}
     parsed = _apply_confirmation(parsed, confirm, {c["topic_id"] for c in shown})
     return parsed, response
-
-
-def _derive_strength(fit_questions: dict | None) -> float | None:
-    """Map the three binary fit questions to a strength score.
-
-    Q2 (representative_citation) is the load-bearing question; the others
-    refine within bands. Returns None if fit_questions are missing or
-    malformed, in which case callers should fall back.
-
-    Mapping:
-    - All 3 yes -> 0.95 (scope-expanding, citable, distinguishing)
-    - Q2 yes + (Q1 or Q3) yes -> 0.80 (citable plus one strong property)
-    - Q2 yes only -> 0.65 (citable but neither expanding nor distinguishing)
-    - Q2 no + (Q1 or Q3 or both) yes -> 0.50 (not citable but some property holds)
-    - All 3 no -> 0.30 (link is forced by the gate but the item is marginal)
-    """
-    if not isinstance(fit_questions, dict):
-        return None
-    try:
-        q1 = bool(fit_questions["q1_scope_expansion"])
-        q2 = bool(fit_questions["q2_representative_citation"])
-        q3 = bool(fit_questions["q3_distinguishing_evidence"])
-    except (KeyError, TypeError):
-        return None
-
-    yes_count = sum([q1, q2, q3])
-    if yes_count == 3:
-        return 0.95
-    if q2 and yes_count == 2:
-        return 0.80
-    if q2 and yes_count == 1:
-        return 0.65
-    if not q2 and yes_count >= 1:
-        return 0.50
-    return 0.30
 
 
 def _parse_decision(raw_text: str) -> dict:
@@ -1037,7 +652,7 @@ def _parse_decision(raw_text: str) -> dict:
     # model is instructed not to emit strength directly, but if it does (legacy
     # behavior), the derived value wins when fit_questions are present.
     if parsed.get("decision") == "link_existing":
-        derived = _derive_strength(parsed.get("fit_questions"))
+        derived = derive_strength(parsed.get("fit_questions"))
         if derived is not None:
             parsed["strength"] = derived
         elif parsed.get("strength") is None:
@@ -1163,11 +778,11 @@ def synthesize_item(
 
     # Build prompt
     if is_cold_start and not proposed_topics:
-        system = render_prompt(COLD_START_SYSTEM_PROMPT, settings)
+        system = cold_start_system_prompt(settings)
     elif not all_topics and proposed_topics:
-        system = render_prompt(COLD_START_SYSTEM_PROMPT, settings)
+        system = cold_start_system_prompt(settings)
     else:
-        system = render_prompt(SYNTHESIZE_SYSTEM_PROMPT, settings)
+        system = synthesize_system_prompt(settings)
 
     item_text = _format_item(item)
     candidates_text = _format_candidates(

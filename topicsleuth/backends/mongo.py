@@ -145,11 +145,6 @@ class MongoStore:
     def delete_observations_for_topic(self, topic_id: str) -> int:
         return self.observations.delete_many({"topic_id": topic_id}).deleted_count
 
-    def reassign_observations(self, source_topic_id: str, target_topic_id: str) -> int:
-        return self.observations.update_many(
-            {"topic_id": source_topic_id}, {"$set": {"topic_id": target_topic_id}}
-        ).modified_count
-
     # ── item embeddings ──
     def save_item_embedding(self, item_url: str, embedding: list[float]) -> None:
         self.items.update_one({"url": item_url}, {"$set": {"embedding": embedding}})
@@ -173,7 +168,7 @@ class MongoStore:
 
     # ── maintenance ──
     def delete_since(self, cutoff: datetime) -> dict:
-        c = cutoff.replace(tzinfo=None) if cutoff.tzinfo else cutoff  # Mongo stores naive UTC
+        c = cutoff  # pymongo encodes an aware datetime as UTC; a naive one is taken as UTC
         obs = self.observations.delete_many({"date": {"$gte": c}}).deleted_count
         older = [t["topic_id"] for t in self.topics.find({"date_identified": {"$lt": c}}, {"topic_id": 1})]
         topics = self.topics.delete_many({"date_identified": {"$gte": c}}).deleted_count

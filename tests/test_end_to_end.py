@@ -15,7 +15,7 @@ from topicsleuth.backends.memory import MemoryStore
 from topicsleuth.record import record
 from topicsleuth.settings import load_settings
 from topicsleuth.synthesize import (
-    COLD_START_SYSTEM_PROMPT,
+    cold_start_system_prompt,
     CONFIRM_LINK_STRENGTH,
     GATE_OVERRIDE_DEFAULT_STRENGTH,
     SynthesisDecision,
@@ -187,7 +187,7 @@ def test_cold_start_uses_the_cold_start_prompt():
     st = MemoryStore()
     d = synthesize_items([_item()], [_Eval("u1", E_B)], st, _settings(), judge, HashEmbedder(DIM))[0]
     assert d.decision == "propose_new" and len(judge.calls) == 1, "nothing to review against on an empty store"
-    assert judge.calls[0][0].startswith(COLD_START_SYSTEM_PROMPT[:40].replace("{domain}", "widget manufacturing"))
+    assert judge.calls[0][0] == cold_start_system_prompt(_settings())
 
 
 def test_leave_one_out_hides_the_items_own_singleton_topic():
@@ -247,6 +247,8 @@ def test_merge_topics_rewrites_target_and_retires_source():
     assert dry["dry_run"] and dry["merged_title"] == "Merged" and st.get_topic("b")["status"] == "emerging"
     out = merge_topics("b", "a", st, _settings(), judge, emb)
     assert out["observations_reassigned"] == 1 and st.count_observations_for_topic("a") == 4
+    moved = st.get_observations_for_item("b0")[0]
+    assert moved["topic_id"] == "a" and moved["moved_from"] == "b" and "MOVED by merge" in moved["reasoning_trace"]
     a, b = st.get_topic("a"), st.get_topic("b")
     assert a["title"] == "Merged" and a["embedding"] == E_A and a["snapshots"][-1]["evidence_count"] == 4
     assert b["status"] == "retired" and b["merged_into"] == "a"
@@ -271,14 +273,19 @@ def test_split_topic_creates_subtopics_and_retires_parent():
     st, emb = _store(), HashEmbedder(DIM)
     subs = {"sub_topics": [{"topic_id": "A One", "title": "A one", "summary": "s1", "tags": ["alpha"], "suggested_directions": []},
                            {"topic_id": "a-two", "title": "A two", "summary": "s2", "tags": [], "suggested_directions": []}]}
-    reassign = [{"item_url": "a0", "new_topic_id": "a-one", "new_strength": 0.9, "new_connection_type": "supports", "reasoning": "r"},
-                {"item_url": "a1", "new_topic_id": "a-two", "new_strength": 0.6, "new_connection_type": "extends", "reasoning": "r"}]
+    yes, no = True, False
+    reassign = [{"item_url": "a0", "new_topic_id": "a-one", "new_connection_type": "supports", "reasoning": "r",
+                 "fit_questions": {"q1_scope_expansion": yes, "q2_representative_citation": yes, "q3_distinguishing_evidence": yes}},
+                {"item_url": "a1", "new_topic_id": "a-two", "new_connection_type": "extends", "reasoning": "r",
+                 "fit_questions": {"q1_scope_expansion": yes, "q2_representative_citation": no, "q3_distinguishing_evidence": no}}]
     judge = ScriptedJudge([subs, reassign])
     out = split_topic("a", st, _settings(), judge, emb)
     assert out["sub_topics_created"] == ["a-one", "a-two"] and out["observations_reassigned"] == 2 and out["observations_deleted"] == 3
     assert st.get_topic("a")["status"] == "retired" and st.get_topic("a")["split_into"] == ["a-one", "a-two"]
-    assert st.count_observations_for_topic("a-one") == 1 and st.get_observations_for_topic("a-two")[0]["strength"] == 0.6
+    assert st.count_observations_for_topic("a-one") == 1 and st.get_observations_for_topic("a-two")[0]["strength"] == 0.5, "derived from the fit questions, not emitted"
     assert st.get_topic("a-one")["snapshots"][-1]["evidence_count"] == 1
+    assert st.get_observations_for_topic("a-one")[0]["strength"] == 0.95
+    assert "widget manufacturing" in judge.calls[0][0] and "widget manufacturing" in judge.calls[1][0]
     assert len(emb.calls) == 2
 
 
@@ -344,7 +351,7 @@ def test_replay_harness_reproduces_a_prior_report(tmp_path):
     prior.write_text(json.dumps({"decisions": [{"item_url": "u1"}, {"item_url": "u2"}, {"item_url": "gone"}]}))
     judge = ScriptedJudge([LINK, PROPOSE, CONFIRM])
     out = tmp_path / "out.json"
-    report = replay_synthesis(st, judge, emb, settings=s, replay_from=prior, output_path=out, progress=False, label="t", leave_one_out=True)
+    report = replay_synthesis(st, judge, emb, settings=s, replay_from=prior, output_path=out, progress=False, label="t")
     assert report["sample_size"] == 2 and report["summary"]["decisions"] == {"link_existing": 1, "propose_new": 1, "skip": 0}
     assert report["config"]["model"] == "scripted" and report["topic_universe"] == 2 and report["replay_from"] == str(prior)
     assert report["summary"]["diagnostics"]["chosen_channel"] == {"vector": 1}

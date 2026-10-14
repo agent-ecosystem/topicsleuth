@@ -33,7 +33,7 @@ def test_list_topics_can_hide_retired():
     assert {t["topic_id"] for t in st.list_topics(include_retired=False)} == {"a", "b"}
 
 
-def test_observations_round_trip_and_reassign():
+def test_observations_round_trip():
     st = _store()
     oid = st.create_observation({"topic_id": "a", "item_url": "u1"})
     st.create_observation({"topic_id": "a", "item_url": "u2"})
@@ -41,9 +41,7 @@ def test_observations_round_trip_and_reassign():
     assert [o["item_url"] for o in st.get_observations_for_item("u1")] == ["u1"]
     st.update_observation(oid, {"strength": 0.9})
     assert st.get_observations_for_item("u1")[0]["strength"] == 0.9
-    assert st.reassign_observations("a", "b") == 2
-    assert st.count_observations_for_topic("b") == 2
-    assert st.delete_observations_for_topic("b") == 2
+    assert st.delete_observations_for_topic("a") == 2
 
 
 def test_returned_documents_are_copies():
