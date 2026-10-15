@@ -873,12 +873,20 @@ def _confirm_proposal(
         f"## Proposed new topic (first pass)\n"
         f"{_format_proposed_topic(parsed.get('new_topic') or {})}"
     )
-    response = judge.complete(confirm_system_prompt(settings), user_content, max_tokens=1024)
-    try:
-        confirm = _robust_json_parse(response.text)
-    except json.JSONDecodeError:
-        logger.warning("Confirmation pass returned unparseable JSON; keeping propose_new")
-        confirm = {"verdict": "confirm_new", "reasoning": "(unparseable reviewer response)"}
+    response = judge.complete(
+        confirm_system_prompt(settings), user_content, max_tokens=settings.judge.confirm_max_tokens,
+    )
+    # The reviewer is advisory: a reply it could not finish, like one it
+    # garbled, leaves the first-pass proposal standing.
+    if response.truncated:
+        logger.warning("Confirmation pass was truncated at max_tokens; keeping propose_new")
+        confirm = {"verdict": "confirm_new", "reasoning": "(truncated reviewer response)"}
+    else:
+        try:
+            confirm = _robust_json_parse(response.text)
+        except json.JSONDecodeError:
+            logger.warning("Confirmation pass returned unparseable JSON; keeping propose_new")
+            confirm = {"verdict": "confirm_new", "reasoning": "(unparseable reviewer response)"}
     parsed = _apply_confirmation(parsed, confirm, {c["topic_id"] for c in shown})
     return parsed, response
 
@@ -1050,7 +1058,9 @@ def synthesize_item(
             f"## Candidate Topics\n{candidates_text}"
         )
 
-    response = judge.complete(system, user_content, max_tokens=2048)
+    response = judge.complete(
+        system, user_content, max_tokens=settings.judge.first_pass_max_tokens,
+    ).require_complete("first-pass decision", "settings judge.first_pass_max_tokens")
     parsed = _parse_decision(response.text)
     shown_ids = {c["topic_id"] for c in all_candidates if c.get("topic_id")}
     parsed = _drop_unshown_classifications(parsed, shown_ids)

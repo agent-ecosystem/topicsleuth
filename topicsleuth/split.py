@@ -270,8 +270,10 @@ def _propose_sub_topics(
         f"{obs_summary}"
     )
 
-    completion = judge.complete(split_propose_system_prompt(settings), user_content, max_tokens=2048)
-    parsed = _parse_json_response(completion.text)
+    completion = judge.complete(
+        split_propose_system_prompt(settings), user_content, max_tokens=settings.judge.split_propose_max_tokens,
+    )
+    parsed = _parse_json_response(completion.require_complete("split proposal", "settings judge.split_propose_max_tokens").text)
     return parsed["sub_topics"]
 
 
@@ -322,8 +324,10 @@ def _reassign_observations(
             + "\n\n".join(obs_lines)
         )
 
-        completion = judge.complete(split_reassign_system_prompt(settings), user_content, max_tokens=4096)
-        batch_result = _parse_json_response(completion.text)
+        completion = judge.complete(
+            split_reassign_system_prompt(settings), user_content, max_tokens=settings.judge.split_reassign_max_tokens,
+        )
+        batch_result = _parse_json_response(completion.require_complete("split reassignment", "settings judge.split_reassign_max_tokens").text)
         # Response is a JSON array
         if isinstance(batch_result, list):
             all_reassignments.extend(batch_result)

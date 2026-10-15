@@ -272,8 +272,10 @@ def _propose_merged_description(
         + _format_topic_for_merge(target, target_obs, "Target Topic (will absorb)")
     )
 
-    completion = judge.complete(merge_system_prompt(settings), user_content, max_tokens=2048)
-    return _parse_json_response(completion.text)
+    completion = judge.complete(
+        merge_system_prompt(settings), user_content, max_tokens=settings.judge.merge_max_tokens,
+    )
+    return _parse_json_response(completion.require_complete("merge rewrite", "settings judge.merge_max_tokens").text)
 
 
 def _parse_json_response(raw_text: str):

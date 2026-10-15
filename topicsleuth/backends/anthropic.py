@@ -25,4 +25,5 @@ class AnthropicJudge:
             text=response.content[0].text,
             input_tokens=getattr(usage, "input_tokens", None),
             output_tokens=getattr(usage, "output_tokens", None),
+            stop_reason=getattr(response, "stop_reason", None),
         )

@@ -70,18 +70,48 @@ class Embedder(Protocol):
     def embed_queries(self, texts: list[str]) -> list[list[float]]: ...
 
 
+class JudgeTruncated(RuntimeError):
+    """The judge stopped at its output-token cap, so the reply is cut off
+    and nothing in it can be trusted as complete. Raised instead of a parse
+    error so the cause is visible; it is deterministic for a given input,
+    so a retry with the same cap fails the same way."""
+
+
 @dataclass
 class Completion:
+    """What a judge returned. ``stop_reason`` is ``"max_tokens"`` when the
+    reply hit the ``max_tokens`` cap, another backend-specific string when
+    it stopped for another reason, and ``None`` when the backend does not
+    report one (fakes may leave it unset)."""
+
     text: str
     input_tokens: int | None = None
     output_tokens: int | None = None
+    stop_reason: str | None = None
+
+    @property
+    def truncated(self) -> bool:
+        return self.stop_reason == "max_tokens"
+
+    def require_complete(self, what: str, setting: str = "max_tokens") -> "Completion":
+        """Return self, or raise ``JudgeTruncated`` if the reply was cut off
+        at the cap. ``what`` names the call and ``setting`` the cap to
+        raise, for the message."""
+        if self.truncated:
+            at = f"{self.output_tokens} output tokens" if self.output_tokens is not None else "the output-token cap"
+            raise JudgeTruncated(f"judge reply for the {what} was truncated at {at}; raise {setting}")
+        return self
 
 
 @runtime_checkable
 class Judge(Protocol):
     """A language model asked for text: the link-or-propose decision, its
     reviewer, and the title and summary rewrites that merge and split make.
-    ``model`` is informational, for replay reports."""
+    ``model`` is informational, for replay reports. ``complete`` should set
+    ``Completion.stop_reason`` to ``"max_tokens"`` when the reply was cut
+    off at the cap, so callers can tell a truncation from a malformed reply.
+    The caps callers pass are generous: an output-token cap costs nothing
+    until the reply reaches it."""
 
     model: str
 

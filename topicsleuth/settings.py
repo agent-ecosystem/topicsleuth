@@ -81,6 +81,29 @@ class SynthesizeConfig:
 
 
 @dataclass
+class JudgeConfig:
+    """Output-token caps, one per call the library makes to the Judge. A
+    cap costs nothing until a reply reaches it, and a reply that does is
+    cut off and refused (``JudgeTruncated``), so the defaults are generous.
+    Raise one when a call reports truncation. Unlike the other sections,
+    two feeders need not agree on these: they shape no decision.
+
+    first_pass_max_tokens: the link-or-propose decision. The reply
+        classifies every shown candidate, each with its own question, so it
+        grows with ``candidates.vector_limit``.
+    confirm_max_tokens: the reviewer's verdict on a proposal.
+    merge_max_tokens: the merged title and summary.
+    split_propose_max_tokens: the proposed sub-topics.
+    split_reassign_max_tokens: one batch of observation reassignments.
+    """
+    first_pass_max_tokens: int = 8192
+    confirm_max_tokens: int = 2048
+    merge_max_tokens: int = 4096
+    split_propose_max_tokens: int = 4096
+    split_reassign_max_tokens: int = 8192
+
+
+@dataclass
 class RecordConfig:
     """Write-stage controls.
 
@@ -105,6 +128,7 @@ class Settings:
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     candidates: CandidateConfig = field(default_factory=CandidateConfig)
     synthesize: SynthesizeConfig = field(default_factory=SynthesizeConfig)
+    judge: JudgeConfig = field(default_factory=JudgeConfig)
     record: RecordConfig = field(default_factory=RecordConfig)
 
 
@@ -165,6 +189,7 @@ def _from_raw(raw: dict[str, Any]) -> Settings:
         embedding=_section(EmbeddingConfig, raw, "embedding"),
         candidates=_section(CandidateConfig, raw, "candidates"),
         synthesize=_section(SynthesizeConfig, raw, "synthesize"),
+        judge=_section(JudgeConfig, raw, "judge"),
         record=_section(RecordConfig, raw, "record"),
     )
 

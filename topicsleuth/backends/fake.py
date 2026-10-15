@@ -50,8 +50,10 @@ class HashEmbedder:
 
 class ScriptedJudge:
     """Returns completions from a script: a list consumed in order, or a
-    callable ``(system, user) -> str | dict``. Dicts are JSON-encoded. Every
-    call is recorded in ``calls`` as ``(system, user)``."""
+    callable ``(system, user) -> str | dict | Completion``. Dicts are
+    JSON-encoded; a ``Completion`` is returned as-is, which is how a test
+    scripts a truncated reply. Every call is recorded in ``calls`` as
+    ``(system, user)``."""
 
     def __init__(self, script: Iterable[str | dict] | Callable[[str, str], str | dict] = (), model: str = "scripted"):
         self.model = model
@@ -72,6 +74,8 @@ class ScriptedJudge:
             out = self._queue.pop(0)
         else:
             raise AssertionError(f"ScriptedJudge ran out of script at call {len(self.calls)}")
+        if isinstance(out, Completion):
+            return out
         text = json.dumps(out) if isinstance(out, (dict, list)) else str(out)
         return Completion(text=text, input_tokens=len(system) + len(user), output_tokens=len(text))
 
