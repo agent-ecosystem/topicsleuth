@@ -190,3 +190,10 @@ def test_tune_replays_a_prior_report(capsys, env):
     assert report["config"]["model"] == "m2" and report["config"]["candidates"]["vector_limit"] == 3 and "leave_one_out" not in report
     code, out = run(capsys, "tune", "synthesize")
     assert code != 0 and "needs --replay" in str(code)
+
+
+def test_the_package_is_a_regular_package_with_one_version():
+    import importlib.metadata
+    import topicsleuth
+    assert topicsleuth.__file__ is not None and topicsleuth.__file__.endswith("__init__.py")
+    assert topicsleuth.__version__ == importlib.metadata.version("topicsleuth")

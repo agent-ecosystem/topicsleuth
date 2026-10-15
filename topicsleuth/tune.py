@@ -44,12 +44,9 @@ def _eval_from_item(item: dict) -> _StoredEval | None:
     return _StoredEval(url=item["url"], embedding=item["embedding"])
 
 
-def _library_version() -> str | None:
-    from importlib.metadata import PackageNotFoundError, version
-    try:
-        return version("topicsleuth")
-    except PackageNotFoundError:
-        return None
+def _library_version() -> str:
+    from topicsleuth import __version__
+    return __version__
 
 
 def _replay_items(store: Store, prior_run: Path) -> list[dict]:

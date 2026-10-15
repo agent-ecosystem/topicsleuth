@@ -1,6 +1,6 @@
 [project]
 name = "topicsleuth"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Topic detection and tracking over a stream of documents: link each item to a topic or open a new one, keep the evidence, and measure how topics move."
 readme = "README.md"
 license = "MIT"
@@ -52,6 +52,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["topicsleuth*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "topicsleuth.__version__" }
 
 [tool.setuptools.package-data]
 topicsleuth = ["config/*.yaml", "py.typed"]
