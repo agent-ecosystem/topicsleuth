@@ -152,7 +152,7 @@ def test_delete_since(store):
     assert scoped["observations_deleted"] == 1 and scoped["topics_deleted"] == 0
     assert sorted(o["item_url"] for o in store.list_observations()) == ["u1", "u2", "u3"]
     result = store.delete_since(cutoff)
-    assert result == {"observations_deleted": 1, "topics_deleted": 1, "topics_kept": 1, "snapshots_cleared": 1}
+    assert result == {"observations_deleted": 1, "topics_deleted": 1, "topics_kept": 1, "topics_busy": 0, "snapshots_cleared": 1}
     assert store.get_topic("new") is None and store.get_topic("old") is not None
     assert store.get_topic("kept") is not None, "a topic recorded in the window but holding older evidence is kept"
     assert [s["evidence_count"] for s in store.get_topic("old")["snapshots"]] == [1]
@@ -207,3 +207,174 @@ def test_datetimes_come_back_timezone_aware(store):
     for o in store.get_observations_for_topic("a"):
         assert o["date"].tzinfo is not None
     assert store.list_topics()[0]["date_identified"].tzinfo is not None
+
+
+def test_deletes_guarded_by_a_deletion_lease(store):
+    """A maintenance operation's destructive writes name the lease it holds;
+    without that lease on the topic, atomically, they do nothing."""
+    _seed(store)
+    store.create_observation({"topic_id": "a", "item_url": "u1"})
+    assert store.delete_observations_for_topic("a", deleting_owner="nobody") == 0
+    assert not store.delete_topic("a", deleting_owner="nobody")
+    assert store.get_topic("a") is not None and store.count_observations_for_topic("a") == 1
+    now = datetime.now(timezone.utc)
+    store.update_topic("a", {"status": "deleting", "deleting": {"prior_status": "emerging", "owner": "me",
+                                                                 "started_at": now, "expires_at": now + timedelta(minutes=15)}})
+    assert store.delete_observations_for_topic("a", deleting_owner="other") == 0
+    assert not store.delete_topic("a", deleting_owner="other")
+    assert store.delete_observations_for_topic("a", deleting_owner="me") == 1
+    assert store.delete_topic("a", deleting_owner="me") and store.get_topic("a") is None
+    assert store.delete_topic("b"), "an unguarded delete still works for callers that own nothing"
+
+
+def test_the_deletion_lease_is_acquired_released_and_taken_over_atomically(store):
+    _seed(store)
+    now = datetime.now(timezone.utc)
+    live, past = now + timedelta(minutes=15), now - timedelta(seconds=1)
+    lease = store.acquire_deletion_lease("a", "one", "reprocess", live)
+    assert lease["owner"] == "one" and lease["prior_status"] == "emerging"
+    assert store.acquire_deletion_lease("a", "two", "clean", live) is None, "a live lease is not taken"
+    assert store.acquire_deletion_lease("a", "one", "reprocess", live)["owner"] == "one", "the holder may renew"
+    assert store.acquire_deletion_lease("missing", "one", "reprocess", live) is None
+    assert store.get_topic("a")["status"] == "deleting"
+    assert [t["topic_id"] for t in store.list_topics(include_retired=False)] == ["b"], "leased topics are not live"
+    assert not store.release_deletion_lease("a", "two")
+    assert store.release_deletion_lease("a", "one") and store.get_topic("a")["status"] == "emerging"
+    assert not store.get_topic("a").get("deleting")
+    # an expired lease is taken over, keeping the original prior status
+    store.update_topic("a", {"status": "active"})
+    store.acquire_deletion_lease("a", "stalled", "reprocess", past)
+    taken = store.acquire_deletion_lease("a", "recover", "recover", live)
+    assert taken["owner"] == "recover" and taken["prior_status"] == "active"
+    store.create_observation({"topic_id": "a", "item_url": "u1"})
+    assert store.delete_observations_for_topic("a", deleting_owner="stalled") == 0, "the old owner's guarded delete is refused"
+    assert not store.delete_topic("a", deleting_owner="stalled")
+    assert store.count_observations_for_topic("a") == 1
+
+
+def test_moving_an_observation_requires_a_live_destination(store):
+    from topicsleuth.interfaces import DestinationNotLive
+    _seed(store)
+    oid = store.create_observation({"topic_id": "a", "item_url": "u1"})
+    with pytest.raises(DestinationNotLive):
+        store.update_observation(oid, {"topic_id": "r"})
+    store.acquire_deletion_lease("b", "w", "reprocess", datetime.now(timezone.utc) + timedelta(minutes=15))
+    with pytest.raises(DestinationNotLive):
+        store.update_observation(oid, {"topic_id": "b"})
+    with pytest.raises(DestinationNotLive):
+        store.update_observation(oid, {"topic_id": "nowhere"})
+    store.release_deletion_lease("b", "w")
+    store.update_observation(oid, {"topic_id": "b", "strength": 0.4})
+    moved = store.get_observations_for_item("u1")[0]
+    assert moved["topic_id"] == "b" and moved["strength"] == 0.4
+
+
+def test_folding_one_observation_into_another_is_one_guarded_write(store):
+    """The store computes what the survivor keeps, from both observations
+    as they are when the write commits: the note on its trace, the union of
+    the plans, the source's history and topic on its own."""
+    from topicsleuth.interfaces import DestinationNotLive, StoreError
+    _seed(store)
+    plan = lambda *tids: [{"topic_id": t, "connection_type": "supports", "strength": 0.8, "fit_questions": None} for t in tids]
+    src = store.create_observation({"topic_id": "a", "item_url": "u1", "strength": 0.5, "decision_links": plan("a", "x"), "removed_from": ["z"]})
+    dst = store.create_observation({"topic_id": "b", "item_url": "u1", "strength": 0.9, "reasoning_trace": "r"})
+    store.acquire_deletion_lease("b", "w", "reprocess", datetime.now(timezone.utc) + timedelta(minutes=15))
+    with pytest.raises(DestinationNotLive):
+        store.fold_observation(src, dst, " folded")
+    both = {o["topic_id"]: o for o in store.get_observations_for_item("u1")}
+    assert sorted(both) == ["a", "b"] and both["b"]["reasoning_trace"] == "r" and "decision_links" not in both["b"], "a refused fold changes nothing"
+    store.release_deletion_lease("b", "w")
+    dead = store.create_observation({"topic_id": "b", "item_url": "dead"})
+    store.delete_observation(dead)
+    with pytest.raises(StoreError):
+        store.fold_observation(src, dead, " folded")
+    assert len(store.get_observations_for_item("u1")) == 2
+    store.fold_observation(src, dst, " folded")
+    left = store.get_observations_for_item("u1")
+    assert len(left) == 1 and left[0]["topic_id"] == "b" and left[0]["strength"] == 0.9
+    assert left[0]["reasoning_trace"] == "r folded" and left[0]["removed_from"] == ["z", "a"]
+    assert [l["topic_id"] for l in left[0]["decision_links"]] == ["b", "a", "x"], "the survivor's own intent, then the folded plan"
+    store.fold_observation(src, dst, " again")
+    assert store.get_observations_for_item("u1")[0]["reasoning_trace"] == "r folded", "a source already gone is nothing to fold"
+
+
+def test_delete_since_leases_every_topic_it_touches_including_old_ones(store):
+    """Cleanup keeps no list of busy topics to go stale: each topic it will
+    write to, old topics with new evidence or snapshots included, is leased
+    just before the writes and given back after them, and one another
+    operation holds is left alone."""
+    now = datetime.now(timezone.utc)
+    then = now - timedelta(days=3)
+    store.create_topic({"topic_id": "old", "recorded_at": then, "status": "active"})
+    store.create_observation({"topic_id": "old", "item_url": "u1", "recorded_at": then})
+    store.create_observation({"topic_id": "old", "item_url": "u2"})
+    store.append_snapshot("old", {"date": then, "evidence_count": 1, "recorded_at": then})
+    store.append_snapshot("old", {"date": now, "evidence_count": 2})
+    store.create_topic({"topic_id": "snap-only", "recorded_at": then})
+    store.append_snapshot("snap-only", {"date": now, "evidence_count": 0})
+    store.create_topic({"topic_id": "busy", "recorded_at": then, "status": "active"})
+    store.create_observation({"topic_id": "busy", "item_url": "u3"})
+    store.append_snapshot("busy", {"date": now, "evidence_count": 1})
+    store.acquire_deletion_lease("busy", "w", "reprocess", now + timedelta(minutes=15))
+    result = store.delete_since(now - timedelta(days=1))
+    assert result == {"observations_deleted": 1, "topics_deleted": 0, "topics_kept": 0, "topics_busy": 1, "snapshots_cleared": 2}
+    old = store.get_topic("old")
+    assert old["status"] == "active" and not old.get("deleting"), "leased for its cleanup, then given back"
+    assert [o["item_url"] for o in store.get_observations_for_topic("old")] == ["u1"]
+    assert [s["evidence_count"] for s in old["snapshots"]] == [1]
+    assert store.get_topic("snap-only")["snapshots"] == [] and store.get_topic("snap-only")["status"] == "emerging"
+    busy = store.get_topic("busy")
+    assert busy["deleting"]["owner"] == "w" and store.count_observations_for_topic("busy") == 1 and len(busy["snapshots"]) == 1
+
+
+def test_publishing_an_embedding_is_a_compare_and_swap_on_its_revision(store):
+    """Every embedding write bumps the revision; a publication names the
+    revision it read and writes nothing if it moved."""
+    store.create_topic({"topic_id": "t", "title": "T", "embedding": [1.0, 0.0, 0.0, 0.0]})
+    assert store.get_topic("t").get("embedding_revision", 0) == 0
+    assert store.publish_topic_embedding("t", {"embedding": [0.0, 1.0, 0.0, 0.0], "embedding_inputs": ["u1"]}, expected_revision=0)
+    t = store.get_topic("t")
+    assert t["embedding_revision"] == 1 and t["embedding"] == [0.0, 1.0, 0.0, 0.0] and t["embedding_inputs"] == ["u1"]
+    assert not store.publish_topic_embedding("t", {"embedding": [0.0, 0.0, 1.0, 0.0], "embedding_inputs": []}, expected_revision=0), "stale"
+    t = store.get_topic("t")
+    assert t["embedding_revision"] == 1 and t["embedding"] == [0.0, 1.0, 0.0, 0.0] and t["embedding_inputs"] == ["u1"], "a refused publication changes nothing"
+    store.update_topic("t", {"embedding": [0.0, 0.0, 0.0, 1.0]})
+    assert store.get_topic("t")["embedding_revision"] == 2, "any embedding write is a publication"
+    store.update_topic("t", {"title": "T2"})
+    assert store.get_topic("t")["embedding_revision"] == 2, "a write that does not touch the embedding is not"
+    assert not store.publish_topic_embedding("t", {"embedding": [1.0, 1.0, 0.0, 0.0], "embedding_inputs": ["u2"]}, expected_revision=1)
+    assert store.publish_topic_embedding("t", {"embedding": [1.0, 1.0, 0.0, 0.0], "embedding_inputs": ["u2"]}, expected_revision=2)
+    assert store.get_topic("t")["embedding_revision"] == 3
+    assert not store.publish_topic_embedding("missing", {"embedding": [1.0, 0.0, 0.0, 0.0]}, expected_revision=0)
+
+
+def test_registering_owed_work_is_atomic_and_only_publication_clears_it(store):
+    """Registration merges the inputs owed and bumps the revision, so a
+    publication that read the topic earlier is refused and leaves the
+    obligation; one that read it after clears it in the same write."""
+    store.create_topic({"topic_id": "t", "title": "T", "embedding": [1.0, 0.0, 0.0, 0.0]})
+    store.defer_topic_refresh("t", ["u1"])
+    store.defer_topic_refresh("t", ["u2", "u1"])
+    t = store.get_topic("t")
+    assert t["embedding_refresh_pending"] is True and t["embedding_refresh_missing"] == ["u1", "u2"] and t["embedding_revision"] == 2
+    assert not store.publish_topic_embedding("t", {"embedding": [0.0, 1.0, 0.0, 0.0], "embedding_inputs": []}, expected_revision=0)
+    t = store.get_topic("t")
+    assert t["embedding_refresh_pending"] is True and t["embedding_refresh_missing"] == ["u1", "u2"], "a refused publication clears nothing"
+    assert store.publish_topic_embedding("t", {"embedding": [0.0, 1.0, 0.0, 0.0], "embedding_inputs": ["u1", "u2"]}, expected_revision=2)
+    t = store.get_topic("t")
+    assert t["embedding_refresh_pending"] is False and t["embedding_refresh_missing"] == [] and t["embedding_revision"] == 3
+    store.defer_topic_refresh("t", [])
+    t = store.get_topic("t")
+    assert t["embedding_refresh_pending"] is True and t["embedding_refresh_missing"] == [] and t["embedding_revision"] == 4
+
+
+def test_a_publication_carries_what_the_refresh_could_not_load(store):
+    store.create_topic({"topic_id": "t", "title": "T", "embedding": [1.0, 0.0, 0.0, 0.0]})
+    store.defer_topic_refresh("t", ["old"])
+    assert store.publish_topic_embedding("t", {"embedding": [0.0, 1.0, 0.0, 0.0], "embedding_inputs": ["u1"]},
+                                         expected_revision=1, missing=["u3", "u2", "u3"])
+    t = store.get_topic("t")
+    assert t["embedding_refresh_pending"] is True and t["embedding_refresh_missing"] == ["u2", "u3"], "the refresh's own view replaces the registration it read under"
+    assert store.publish_topic_embedding("t", {"embedding": [0.0, 1.0, 0.0, 0.0], "embedding_inputs": ["u1", "u2", "u3"]}, expected_revision=2)
+    t = store.get_topic("t")
+    assert t["embedding_refresh_pending"] is False and t["embedding_refresh_missing"] == []

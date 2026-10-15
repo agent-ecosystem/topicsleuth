@@ -2,10 +2,10 @@
 import json, sys
 from collections import Counter
 a = json.load(open(sys.argv[1])); b = json.load(open(sys.argv[2]))
-def tid(d): return d.get("topic_id", d.get("theme_id"))  # reports before the rename say theme_id
+def tid(d): return d.get("topic_id")
 def tids(d): return sorted(l["topic_id"] for l in d.get("links") or []) or ([tid(d)] if tid(d) else [])
-def new_tid(d): return tid(d.get("new_topic") or d.get("new_theme") or {})
-def hdr(r): return f"{r.get('label') or r['run_at'][:10]} model={r['config']['model']} topics={r.get('topic_universe', r.get('theme_universe', '?'))} tag_overlap={r['config'].get('candidates',{}).get('tag_overlap','?')}"
+def new_tid(d): return tid(d.get("new_topic") or {})
+def hdr(r): return f"{r.get('label') or r['run_at'][:10]} model={r['config']['model']} topics={r.get('topic_universe', '?')} tag_overlap={r['config'].get('candidates',{}).get('tag_overlap','?')}"
 print("A:", hdr(a)); print("B:", hdr(b))
 for k in ("link_existing","propose_new","skip"):
     print(f"  {k:<14} A={a['summary']['decisions'][k]:>3} ({a['summary']['decisions_pct'][k]}%)   B={b['summary']['decisions'][k]:>3} ({b['summary']['decisions_pct'][k]}%)")

@@ -18,8 +18,20 @@ from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
 
 
+# How long a maintenance operation's deletion mark on a topic is honoured
+# before another caller may take it over as abandoned.
+DELETING_LEASE_SECONDS = 900
+
+
 class StoreError(RuntimeError):
     """A store could not be reached or refused the operation."""
+
+
+class DestinationNotLive(StoreError):
+    """update_observation or fold_observation was asked to put an
+    observation on a topic that is retired, marked deleting, or gone. The
+    check and the write are one operation, so a destination leased for
+    deletion in between is refused and nothing is written."""
 
 
 class DuplicateTopic(StoreError):
@@ -37,7 +49,8 @@ class DuplicateObservation(StoreError):
 class ItemFailure:
     """One item the pipeline could not finish. ``stage`` names where it
     stopped (synthesize, embed_proposal, create_topic, create_observation,
-    save_embedding); the item should be retried, not acknowledged."""
+    relocate, save_embedding, snapshot, snapshot_rebuild, status,
+    embedding_refresh); the item should be retried, not acknowledged."""
 
     item_url: str
     stage: str
@@ -134,6 +147,13 @@ class Store(Protocol):
     was written, which a store stamps itself if the caller did not. It is
     distinct from ``date`` and ``date_identified``, which are when the
     evidence happened, and it is what ``delete_since`` works from.
+
+    Several operations below are guarded: they test a condition on the
+    topic (that a lease is held, that a destination is live) and write
+    only if it holds. The test and the write are one operation, atomic
+    with respect to every other caller of the store, whichever threads or
+    processes they run in. ``topicsleuth.backends.memory`` is the
+    reference: one lock around every operation.
     """
 
     # ── topics ──
@@ -143,9 +163,61 @@ class Store(Protocol):
 
     def create_topic(self, topic_doc: dict) -> str: ...
 
-    def update_topic(self, topic_id: str, updates: dict) -> None: ...
+    def update_topic(self, topic_id: str, updates: dict) -> None:
+        """Apply ``updates``. One that sets ``embedding`` is a publication
+        of the embedding and bumps ``embedding_revision``."""
+        ...
 
-    def delete_topic(self, topic_id: str) -> bool: ...
+    def publish_topic_embedding(self, topic_id: str, fields: dict, *, expected_revision: int,
+                                missing: list[str] = ()) -> bool:
+        """Write ``fields`` (an embedding and what describes it) and set
+        the topic's refresh obligation to ``missing``, the inputs the
+        refresh wanted and could not load (``embedding_refresh_missing``
+        becomes exactly that list, ``embedding_refresh_pending`` whether it
+        is non-empty), only if the topic's ``embedding_revision`` is still
+        ``expected_revision`` (0 for a topic never published to), and bump
+        it, as one operation. Returns False, writing nothing, if an
+        embedding was published or an obligation registered since the
+        caller read that revision: the refresh's view of what is owed is
+        only valid for the state it read."""
+        ...
+
+    def defer_topic_refresh(self, topic_id: str, missing: list[str]) -> None:
+        """Register that the topic owes an embedding refresh: set
+        ``embedding_refresh_pending``, add ``missing`` (item urls whose
+        embeddings the refresh needs and the store does not have) to
+        ``embedding_refresh_missing`` without dropping what is there, and
+        bump ``embedding_revision``, as one operation, so a publication in
+        flight cannot clear this obligation."""
+        ...
+
+    def delete_topic(self, topic_id: str, *, deleting_owner: str | None = None) -> bool:
+        """Delete the topic. With ``deleting_owner``, only if the topic is
+        marked ``deleting`` by that owner, atomically, so an owner that lost
+        its lease cannot finish a deletion someone else undid."""
+        ...
+
+    # ── the deletion lease ──
+    # A maintenance operation that will delete from a topic takes a lease
+    # on it first: the topic is marked ``deleting`` with the owner, an
+    # expiry and the status to restore. Recording refuses a leased
+    # destination, other maintenance leaves it alone, and every destructive
+    # write the owner makes names its lease and is refused once the lease
+    # is gone. The three operations below are atomic with respect to one
+    # another and to the lease state they test; nothing else writes the
+    # lease.
+
+    def acquire_deletion_lease(self, topic_id: str, owner: str, by: str, expires_at: datetime) -> dict | None:
+        """Take or renew the lease, atomically: succeeds if the topic has no
+        lease, an expired one, or one held by ``owner``. Returns the lease
+        (with ``prior_status``, kept from the first acquisition) or None if
+        another owner's lease is live or the topic does not exist."""
+        ...
+
+    def release_deletion_lease(self, topic_id: str, owner: str) -> bool:
+        """Give the topic back with its prior status, atomically, only if
+        ``owner`` still holds the lease."""
+        ...
 
     def append_snapshot(self, topic_id: str, snapshot: dict) -> None: ...
 
@@ -170,11 +242,34 @@ class Store(Protocol):
 
     def list_observations(self) -> list[dict]: ...
 
-    def update_observation(self, obs_id: Any, updates: dict) -> None: ...
+    def update_observation(self, obs_id: Any, updates: dict) -> None:
+        """Apply ``updates``. When they move the observation to another
+        topic, that topic must be live (not retired, deleting or gone) at
+        the moment of the write, atomically, else ``DestinationNotLive``;
+        and the new (item_url, topic_id) must be free, else
+        ``DuplicateObservation``."""
+        ...
+
+    def fold_observation(self, obs_id: Any, into_obs_id: Any, note: str) -> None:
+        """Merge observation ``obs_id`` into ``into_obs_id`` (one item,
+        evidence on both sides of a move or merge): the survivor is
+        written with ``topicsleuth.history.fold_fields`` of the two as
+        they are at the moment of the write (``note`` appended to its
+        trace, the union of their plans, the source's history and topic
+        added to its own) and the other is deleted, as one operation. The
+        survivor's topic must be live then, else ``DestinationNotLive``
+        and nothing changes; a missing survivor is a ``StoreError``; a
+        source already gone is nothing to fold."""
+        ...
 
     def delete_observation(self, obs_id: Any) -> bool: ...
 
-    def delete_observations_for_topic(self, topic_id: str) -> int: ...
+    def delete_observations_for_topic(self, topic_id: str, *, deleting_owner: str | None = None) -> int:
+        """Delete the topic's observations. With ``deleting_owner``, only
+        while the topic is marked ``deleting`` by that owner, atomically
+        with the lease: a lease that changes hands before the delete
+        commits means nothing is deleted."""
+        ...
 
     # ── item embeddings ──
     def save_item_embedding(self, item_url: str, embedding: list[float]) -> None: ...
@@ -190,8 +285,16 @@ class Store(Protocol):
         ``run_id``, only documents that run stamped. A topic in the window
         that still holds observations from outside it (evidence moved onto
         it, or recorded earlier) is kept, not deleted, and counted under
-        ``topics_kept``. Returns counts: observations_deleted,
-        topics_deleted, topics_kept, snapshots_cleared.
+        ``topics_kept``.
+
+        Every topic the window touches, including an older topic that only
+        has an observation or snapshot in it, is leased for the whole of
+        the writes made to it and given back, or deleted, under that same
+        lease; nothing is written to it after. A topic another operation
+        holds is left entirely alone, document, observations and
+        snapshots, and counted under ``topics_busy``. Returns counts:
+        observations_deleted, topics_deleted, topics_kept, topics_busy,
+        snapshots_cleared.
 
         This removes documents; it does not restore a status, embedding or
         description a run changed."""

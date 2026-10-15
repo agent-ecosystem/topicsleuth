@@ -38,7 +38,7 @@ object with the right methods qualifies, no base class.
 
 Each default imports its SDK lazily and ships behind an extra
 (`topicsleuth[mongo]`, `[voyage]`, `[anthropic]`, or `[all]`), so the core
-package depends on pyyaml and numpy only.
+package depends on pyyaml, numpy and python-dotenv only.
 
 Why this shape and not a plugin registry: there is one implementation per
 seam today and perhaps two tomorrow. Constructor injection is the idiom for
@@ -119,42 +119,59 @@ it lands. The rules the write path follows:
   strength and connection type, and `record` writes one observation per
   link. Stores enforce both identities atomically (unique indexes in Mongo)
   on insert and update, and raise `DuplicateTopic` / `DuplicateObservation`.
-  The stored observations are the durable decision for their item:
-  `synthesize_items` does not call the judge for an item the store holds,
-  and `record` reports it under `already_recorded` with the stored outcome
-  and applies none of this batch's links for it, so a retry cannot choose
-  different topics or open a second one, and two feeders deciding
-  differently about one document leave the first writer's observations.
-  The loser of that race removes the empty topic it opened. Every
-  observation carries the whole decision it was part of, under
-  `decision_links`, so the intended link set is durable from the first
-  write: a retry reads it back from any one observation and writes the
-  links that are missing, and an item is not clear of `failed_urls()`
-  until every intended link is in the store. Curation does not rewrite
-  those copies; the plan is read against curation's own marks instead. A
-  topic any of the item's observations was `moved_from` or `folded_from`
-  was taken off the item on purpose and is never revived. A planned topic
-  the item is not yet on is followed through merges to its live successor,
+  A proposal whose id exists with the same title is reused; a different
+  title is a collision and the item fails. Synthesis picks a slug no
+  existing or batch topic uses.
+- **The stored observations are the decision.** `synthesize_items` does
+  not call the judge for an item the store holds, and `record` reports it
+  under `already_recorded` with the stored outcome and applies none of
+  this batch's links for it, so a retry cannot choose different topics or
+  open a second one, and two feeders deciding differently about one
+  document leave the first writer's observations. The loser of that race
+  removes the empty topic it opened. Every observation carries the whole
+  decision it was part of, under `decision_links`, so the intended link
+  set is durable from the first write: a retry reads it back from any one
+  observation and writes the links that are missing, and an item is not
+  clear of `failed_urls()` until every intended link is in the store.
+  Whether a later batch may add links to a recorded item is a separate
+  policy, and the answer today is no.
+- **The plan is read against curation's history.** Curation does not
+  rewrite `decision_links`. Every observation keeps a cumulative
+  `removed_from` list: move, merge, fold, split and reprocess append the
+  topic the item was taken off, reprocess writes the deleted topic onto
+  the item's other observations, and a fold carries the folded
+  observation's history and plan onto the survivor, so a link only it
+  carried, approved and not yet written, is still intended, and one
+  removed on purpose is still not. A topic in that history is never
+  revived, however many steps ago it was removed. A planned topic the
+  item is not yet on is followed through merges to its live successor,
   and dropped if that successor is already present or the topic was
-  deleted, retired by a split, or is being deleted. Whether a later batch
-  may add links to a recorded item is a separate policy, and the answer
-  today is no. Merges and moves fold an item already on the target into the
-  target's observation, noted in its trace. A proposal whose id exists with the same title is reused; a
-  different title is a collision and the item fails. Synthesis picks a slug
-  no existing or batch topic uses.
+  deleted or retired by a split. A topic that is only marked `deleting`
+  is blocked, not removed: the link stays intended and recording fails
+  the item with that reason until the mark is resolved, so a decision
+  never looks complete because part of it was temporarily unwritable. An
+  observation found on a retired merge source (it landed as the topic was
+  merged, too late for the merge's own sweep) stands for the live
+  successor: before treating the item as recorded, a run moves it there,
+  folded into the item's observation on the successor if it has one. If
+  the successor is itself leased for deletion, the observation waits
+  where it is as the durable record of the decision and the item fails as
+  blocked; if there is no live successor, the observation is withdrawn
+  and the item fails, to be judged again. Where an observation sits is
+  never taken as proof that its decision is complete.
 - **Failures are per item, and a retry finishes the work.** A judge call
   that fails or answers outside the contract, a proposal whose embedding
-  fails, a topic that cannot be created, a destination that no longer
-  exists or is retired, a store write that fails at any stage (the
-  observation, the item embedding, the snapshot, the status): each becomes
-  an `ItemFailure` with its stage in `RecordResult.failures`.
+  fails, a topic that cannot be created, a destination that does not
+  exist or is retired, a store write that fails at any stage (the
+  observation, a repair of a stored one, the item embedding, the snapshot,
+  the status, the refresh): each becomes an `ItemFailure` with its stage
+  in `RecordResult.failures`, and the other items in the batch go on.
   `synthesize_items` carries failures as decisions with
   `decision="failed"` so a batch is always fully accounted for. Nothing is
   written before the observation for an item that fails earlier; a failure
   after it leaves the observation in place, and the retry, finding it,
-  resumes what is missing (the snapshot if none was recorded since, the
-  status its snapshot implies, the embedding) rather than inserting again.
-  A feeder acknowledges only the items outside `failed_urls()`.
+  resumes what is missing rather than inserting again. A feeder
+  acknowledges only the items outside `failed_urls()`.
 - **The judge's answer is validated before it is written.** Decision and
   connection type must be known values, a link must name a shown
   candidate and carry the fit answers (or come from the gate or the
@@ -171,38 +188,99 @@ it lands. The rules the write path follows:
   so the series and the latest count the judge is shown include the
   backfill. Topics founded after the batch's date are not status-checked
   by it.
-- **Ingestion and maintenance coordinate through the topic's status, not
-  a lock.** Merge, split, move, reprocess and clean may run while a feeder
-  records. Each maintenance operation marks the topic before it decides:
-  merge and split set `retired` (with `merged_into` or `split_into`),
-  clean and reprocess set `deleting` before counting or deleting. Recording
-  refuses a marked destination before the insert and re-reads it after:
-  if the topic was merged meanwhile the observation follows the merge; if
-  it was retired by a split, marked for deletion or deleted, the
+- **Maintenance holds a lease, and recording checks after it writes.**
+  Merge, split, move, reprocess and clean may run while a feeder records.
+  Merge and split retire their source (with `merged_into` or
+  `split_into`) and carry along anything that landed on it before the
+  mark. Clean and reprocess take a deletion lease on a topic before
+  touching it: the topic is marked `deleting` with its owner, an expiry
+  (`DELETING_LEASE_SECONDS`, fifteen minutes) and the status to restore,
+  and the store owns the lease. Acquiring, renewing and releasing are
+  each one conditional store operation (`acquire_deletion_lease`,
+  `release_deletion_lease`), so two callers racing for a topic are
+  ordered by the store and one loses. Every destructive write an owner
+  makes names its lease: `delete_topic` is one conditional delete, and
+  `delete_observations_for_topic` runs, in Mongo, in a transaction that
+  writes the topic under the lease filter, so a lease that changed hands
+  before the delete commits means nothing is deleted. A live lease is
+  another operation at work and is left entirely alone, document,
+  observations and snapshots, by clean, by reprocess and by recovery;
+  only an expired one may be taken over, and the takeover is the same
+  atomic acquisition. `recover_interrupted_deletions` takes over expired
+  leases, restores a marked topic that still holds evidence and deletes
+  one that does not, and the clean and reprocess commands run it first.
+  Overlapping maintenance on one topic is refused, not serialized: the
+  later operation reports the topic as busy. Clean leases each topic it
+  will write to, an old topic with new evidence or snapshots included,
+  just before those writes, makes them all under that lease (in Mongo,
+  one transaction per topic), keeps a topic that still holds evidence
+  from outside the window and restores its status, and deletes or gives
+  back the topic under the same lease, writing nothing to it after.
+  Recording refuses a retired or leased destination before the insert and
+  re-reads it after. If the topic was merged meanwhile the observation
+  follows the merge, folded into the item's observation on the successor
+  if it has one; if it was retired by a split, leased or deleted, the
   observation is withdrawn and the item fails, to be re-judged next run.
-  Clean keeps a topic whose count, taken after the mark, is not zero, and
-  restores its status. The mark keeps the prior status on the topic
-  document, so a cleanup that fails or crashes after marking can be
-  finished by anyone: `recover_interrupted_deletions` restores a marked
-  topic that still holds evidence and deletes one that does not, and the
-  clean and reprocess commands run it first. Merge and split carry along
-  anything that landed on their source before the mark. This is not atomicity: the one write both
-  sides see, the status, is what orders them. An insert whose post-check
-  beat the mark is counted by the maintenance side, because the mark
-  precedes the count; one that did not is refused by the post-check. No
-  adapter needs more than a status field for this.
+  An insert whose post-check beat the mark is counted by the maintenance
+  side, because the mark precedes the count; one that did not is refused
+  by the post-check. Curation never writes onto a leased topic: move,
+  merge and split refuse a `deleting` destination, and
+  `update_observation` makes the liveness check and the write one
+  operation (`DestinationNotLive`), so a lease that lands between a
+  caller's check and its write still wins. A fold, an item already on the
+  target of a move or merge, is one store operation too
+  (`fold_observation`): the destination's liveness, the survivor's update
+  and the source's deletion commit together or not at all, and the store
+  computes what the survivor keeps (the union of the two plans, the two
+  histories) from both observations as they are when the write commits,
+  so two folds into one survivor each keep what the other added. The
+  reference store serializes every operation under one lock, which is
+  what its atomicity means across threads, and a store adapter is held to
+  the same: the contract tests exercise the guarded operations against a
+  lease that has already changed hands. An adapter needs conditional
+  writes and, where one operation touches two documents, a transaction;
+  nothing else.
 - **Derived state retries until it lands.** The snapshot, the later
   snapshots a backfill recomputes, the status, the item embedding and the
   topic's embedding refresh are each derived from the store and safe to
-  repeat. A failure in any of them fails the items that caused it; the
-  retry, finding the observation, redoes whichever is missing. The refresh
-  is the one stage whose trigger (a count crossing a threshold) happens
-  once, so a failed or deferred refresh leaves `embedding_refresh_pending`
-  on the topic and the next run that touches it tries again. A refresh
-  also waits for its inputs: it runs after the batch's item embeddings
-  are saved, and is deferred, not skipped, while an embedding this batch
-  owes the topic failed to save, so it is never computed from incomplete
-  inputs and then taken as done.
+  repeat. A failure in any of them fails the items that caused it, and the
+  retry, finding the observation, redoes whichever is missing. What is
+  missing is read from the store, never from what the failed call
+  remembered:
+  - the snapshot is owed until one of the topic postdates the
+    observation's arrival there, by `recorded_at` or, when a repair moved
+    the observation onto the topic, by `relocated_at`, stamped in the same
+    write as the move;
+  - a threshold refresh is owed whenever a threshold lies between the
+    count the embedding was last refreshed at (`embedding_refreshed_count`,
+    written with the embedding) and the count now; a count that fell
+    below that mark owes a refresh at the next threshold from zero;
+  - an item's embedding is owed to its topic as soon as its observation is
+    in the store, and its save is attempted whatever else failed for the
+    item; an input a refresh could not load is owed until a refresh that
+    included it has been written. Every refresh records the inputs it was
+    computed from under `embedding_inputs`; that list, not the time the
+    refresh finished, is its claim to completeness, and a relocated
+    observation is answered only by a refresh whose inputs include it;
+  - `embedding_refresh_pending` and `embedding_refresh_missing` record a
+    refresh that failed, was deferred for want of an embedder, or
+    published without inputs it wanted. Registering them is one store
+    operation (`defer_topic_refresh`) that merges with what other batches
+    registered.
+
+  The refresh runs after the batch's item embeddings are saved, computes
+  from the inputs it can load, and publishes through one compare-and-swap
+  store operation (`publish_topic_embedding`) on `embedding_revision`,
+  which every embedding write and every registration bumps: the write
+  lands only if nothing was published or registered since the refresh
+  read the topic, and it sets the obligation, to exactly what the refresh
+  could not load, in the same write. A refresh that loses that race
+  recomputes from the current state; one that loses it three times
+  reports a conflict rather than publish, and the items that asked for it
+  fail and retry. So an older refresh can neither overwrite a newer result
+  nor clear work registered after it read, a partial result never claims
+  completeness, and the writer that saves an omitted input finds the
+  refresh still owed.
 - **Removal, not undo.** Every topic, observation and snapshot carries
   `recorded_at` (ingestion time, stamped by the store) and optionally the
   `run_id` the feeder passed. `delete_since` removes by those, keeps a
@@ -226,5 +304,4 @@ examples of the file shapes under `data/examples/`.
 The tracked thing is a **topic**: the topic detection and tracking
 literature's word, where an item is a story, proposing one is first-story
 detection and linking is tracking. The evidence record is an
-**observation**. Reports and label sets written before the name settled
-say `theme_id`; the scripts read either.
+**observation**.

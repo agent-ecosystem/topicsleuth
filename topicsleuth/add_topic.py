@@ -20,6 +20,7 @@ from pathlib import Path
 
 import yaml
 
+from topicsleuth.history import removed_history
 from topicsleuth.interfaces import Embedder, Store
 from topicsleuth.synthesize import _sanitize_topic_id
 
@@ -149,7 +150,14 @@ def move_observations(
         sources.add(src)
         # An item may already be evidence on the target (it bore on both
         # questions). One observation per item per topic: the target's
-        # survives and the moving one is folded into it, noted in the trace.
+        # survives and the moving one is folded into it, noted in the
+        # trace. The fold is one store operation: the target must be live
+        # when it commits, and the survivor's update and the source's
+        # deletion land together or not at all. The store gives the
+        # survivor the folded observation's plan and history, read at the
+        # moment of the write, so a link that only it carried, approved
+        # and not yet written, survives the fold, and so does whatever
+        # another fold into the same survivor added meanwhile.
         holder = next((h for h in store.get_observations_for_item(o["item_url"])
                        if h.get("topic_id") == target_topic_id), None)
         if holder is not None:
@@ -158,13 +166,7 @@ def move_observations(
                 f"observation on '{src}' (strength {o.get('strength')}, {o.get('connection_type')}) "
                 f"was merged into this one."
             )
-            store.update_observation(holder["_id"], {
-                "reasoning_trace": (holder.get("reasoning_trace") or "") + note,
-                # Curation took this item off ``src``: a retry must not read
-                # the item's plan as still calling for it.
-                "folded_from": sorted(set(holder.get("folded_from") or []) | {src}),
-            })
-            store.delete_observation(o["_id"])
+            store.fold_observation(o["_id"], holder["_id"], note)
             logger.info("Folded duplicate observation of %s from %s into %s", o["item_url"], src, target_topic_id)
             continue
         note = (
@@ -175,6 +177,7 @@ def move_observations(
             "topic_id": target_topic_id,
             "reasoning_trace": (o.get("reasoning_trace") or "") + note,
             "moved_from": src,
+            "removed_from": removed_history(o, src),
         })
 
     retired: list[str] = []
@@ -205,8 +208,8 @@ def move_observation(
     target = store.get_topic(target_topic_id)
     if not target:
         raise ValueError(f"target topic not found: {target_topic_id}")
-    if target.get("status") == "retired":
-        raise ValueError(f"target topic is retired: {target_topic_id}")
+    if target.get("status") in ("retired", "deleting"):
+        raise ValueError(f"target topic is {target['status']}: {target_topic_id}")
     moves, missing = plan_moves(store, [item_url], target_topic_id)
     if not moves:
         raise ValueError(

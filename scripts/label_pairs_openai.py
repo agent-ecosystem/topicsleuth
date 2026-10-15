@@ -85,7 +85,7 @@ def request(path: str, key: str, body: dict | None = None, retries: int = 4) -> 
 
 
 def format_pair(p: dict) -> str:
-    it, th = p["item"], (p.get("topic") or p["theme"])  # pairs.json predates the rename
+    it, th = p["item"], p["topic"]
     reps = "\n".join(f"  * {r}" for r in th.get("representative_observations") or []) or "  (none besides this item)"
     return (
         f"## Item\nTitle: {it['title']}\nSummary: {it.get('summary','')}\n"

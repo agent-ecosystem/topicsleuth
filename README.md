@@ -22,7 +22,7 @@ To use topicsleuth with the default backends, you need:
   - path `embedding`
   - cosine similarity
   - number of dimensions matching your embedding model
-  - index name `topic_embedding_index`
+  - index name `topic_embedding_index` (or set `TOPICSLEUTH_VECTOR_INDEX`)
 - API keys for:
   - Voyage embeddings
   - Anthropic
@@ -76,6 +76,8 @@ import `record`, `settings`, and `synthesize` to make and store
 observations related to your topics:
 
 ```python
+from datetime import date
+
 from topicsleuth.backends.anthropic import AnthropicJudge
 from topicsleuth.backends.mongo import MongoStore
 from topicsleuth.backends.voyage import VoyageEmbedder
@@ -98,10 +100,13 @@ vectors = embedder.embed_documents([f"{d['title']}\n\n{d.get('summary', '')}" fo
 evals = [Eval(d["url"], v, True) for d, v in zip(items, vectors)]
 
 decisions = synthesize_items(items, evals, store, settings, judge, embedder)
-result = record(items, evals, decisions, store, settings=settings, embedder=embedder)
+result = record(items, evals, decisions, store, settings=settings, embedder=embedder,
+                run_id=f"my-feed-{date.today()}")   # so `clean --run-id` can remove this run
 
 for obs in result.observations_created:
     print(f"{obs['item_title']} -> {obs['topic_id']} ({obs['connection_type']})")
+for obs in result.already_recorded:    # held from an earlier run; not judged or written again
+    print(f"{obs['item_title']} was already on {obs['topic_id']}")
 for failure in result.failures:        # retry these next run; do not mark them done
     print(f"{failure.item_url} failed at {failure.stage}: {failure.error}")
 ```
@@ -109,11 +114,14 @@ for failure in result.failures:        # retry these next run; do not mark them 
 Recording is safe to retry. A document is evidence for a topic once: the
 store holds one observation per document per topic, so running the same
 batch twice, or two programs admitting the same document, writes it once,
-and a document the store already holds is not judged again. A document that could not be
+and a document the store already holds is not judged again; the result
+lists it under `already_recorded`. A document that could not be
 finished is listed in `result.failures` with the stage it stopped at.
 Keep it in your queue and hand it over again next run: every stage is
 idempotent, so the retry completes what the failed run left undone (a
-snapshot, a status, an embedding) without repeating what it did.
+snapshot, a status, an embedding) without repeating what it did. Pass a
+`run_id` and everything the run writes is stamped with it, which is what
+lets `clean --run-id` remove one run and nothing else.
 
 ## Keep track of content across days, not just today
 
@@ -182,7 +190,8 @@ You might find topicsleuth useful when:
   is made by a model, and that is where the cost goes.
   
 You will also need a database with vector search; MongoDB Atlas works out
-of the box, and anything else needs a small adapter.
+of the box, and anything else needs an adapter (see "Bring your own
+models and database" for what one has to provide).
 
 It is the wrong tool if you want to discover clusters in a corpus you
 already have (that is topic modeling), if you want a dashboard or alerts
@@ -431,8 +440,18 @@ topicsleuth add-topic topic.yaml --link <url>   # open a page by hand and move n
 topicsleuth move-observation <url> <topic_id>   # move one document's entry to another page
 topicsleuth reprocess-tail --max-obs 1 --older-than-days 60   # clear pages that never got a second entry
 topicsleuth seed topics.yaml                    # start an empty store from a list of topics
+topicsleuth backfill-embeddings                 # embed topics that have none; refresh well-evidenced ones
 topicsleuth clean --hours 28                    # remove what the last run wrote
 ```
+
+`reprocess-tail` clears the pages but does not re-judge their documents:
+it writes their URLs to a file (under `tuning_runs/` by default, or
+`--urls-out`), and your feeder hands those documents over again on its
+next run so they find a home among the topics that exist now.
+`backfill-embeddings` is for after an import or a change of embedding
+model: it embeds every topic that has no vector and recomputes the
+vector of every topic with at least five entries from the entries'
+own embeddings.
 
 Nothing here re-judges a document, except that a split asks the judge to
 re-assess each entry's strength and connection type against its narrower
@@ -444,11 +463,14 @@ target's entry, with the other folded into it and noted. A
 split is checked in full before anything is written: every entry assigned
 exactly once, to a sub-topic that exists, with a known connection type.
 
-These commands may run while a feeder is writing. There is no lock;
-each command marks a topic before deciding its fate, recording refuses a
-marked topic and re-checks after it writes, and a merge or split carries
-along anything that arrived before its mark. An entry withdrawn this way
-fails its document, which is retried next run.
+These commands may run while a feeder is writing. A document caught
+between a command and the feeder fails that run and is retried on the
+next, and a merge or split carries along anything that arrived on its
+source while it ran. If a command dies part-way through deleting a
+topic, the topic stays marked for up to fifteen minutes, during which
+recording and the other commands skip it and report it as busy; the next
+`clean` or `reprocess-tail` then finishes or undoes the interrupted
+deletion on its own.
 
 `clean` removes the observations, topics and snapshots written in a
 window, by when they were written rather than when their evidence
@@ -456,6 +478,8 @@ happened, and with `--run-id` only what one run wrote (pass `run_id` to
 `record` and the run stamps everything it writes). It is not a full undo.
 A topic written in the window that still holds older evidence is kept,
 and a status, embedding or description a run changed is not restored.
+A topic another command is working on is left alone and reported as
+busy; run `clean` again once that command has finished.
 
 ## Bring your own content
 
@@ -471,9 +495,18 @@ sharing one store cannot disagree about where things belong.
 Every service the library talks to is an object you construct and pass
 in: the embedding model, the language model that judges, the database,
 and optionally a decision-only model that reviews proposals in place of
-the judge's second call. Each is a small `typing.Protocol` in
+the judge's second call. Each is a `typing.Protocol` in
 `topicsleuth.interfaces`, with the methods listed there; anything that has
-them works, with no base class to inherit. Defaults for Voyage, Anthropic,
+them works, with no base class to inherit. The model protocols are a
+method or two. The store protocol is larger, and a few of its operations
+must be atomic: a conditional update for the lease a maintenance command
+takes on a topic, for publishing a topic's embedding and for registering
+a refresh it still owes, and a transaction wherever one operation writes
+two documents (deleting a leased topic's entries, moving or folding an
+entry onto a topic that must still be live). The docstrings on the
+protocol say which, and the store contract test in the source tree is the
+specification: an adapter that passes it will behave under retries and
+concurrent writers the way the defaults do. Defaults for Voyage, Anthropic,
 MongoDB Atlas and TypeSafe Jev are included as extras (`voyage`,
 `anthropic`, `mongo`), and the core package itself depends only on pyyaml,
 numpy and python-dotenv.
@@ -509,7 +542,10 @@ Loading history rather than today's documents? Pass `date_from_item=True`
 to `record` so entries are dated by publication rather than by the run,
 and load oldest first. A batch dated before a topic's latest snapshot is
 inserted into its history: the snapshot counts only evidence up to its
-date, and the topic's current status is left to the newer evidence.
+date, and the topic's current status is left to the newer evidence. Pass
+`backfill=True` as well and every entry the batch writes is stamped
+`backfill`, so you can tell re-homed history from evidence that arrived
+fresh.
 
 ## Test without spending anything
 
@@ -524,8 +560,9 @@ from topicsleuth.backends.memory import MemoryStore
 ```
 
 The `topicsleuth` command uses the same stand-ins when
-`TOPICSLEUTH_STORE=memory`, `TOPICSLEUTH_JUDGE=scripted` and
-`TOPICSLEUTH_EMBEDDER=hash` are set, which is how its own tests run. If
+`TOPICSLEUTH_STORE=memory`, `TOPICSLEUTH_JUDGE=scripted`,
+`TOPICSLEUTH_EMBEDDER=hash` and `TOPICSLEUTH_DECISION=scripted` are set,
+which is how its own tests run. If
 you write a store adapter, the store contract test in the source tree's
 `tests/` folder (not in the wheel) runs against it.
 

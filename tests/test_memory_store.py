@@ -76,6 +76,6 @@ def test_item_embeddings_and_delete_since():
     # every topic in _store() was recorded just now, so all but "a" go; "a"
     # is kept because the two-day-old observation still sits on it, and
     # its recent snapshot is cleared
-    assert result == {"observations_deleted": 1, "topics_deleted": 3, "topics_kept": 1, "snapshots_cleared": 1}
+    assert result == {"observations_deleted": 1, "topics_deleted": 3, "topics_kept": 1, "topics_busy": 0, "snapshots_cleared": 1}
     assert [s["evidence_count"] for s in st.get_topic("a")["snapshots"]] == [1]
     assert [o["item_url"] for o in st.list_observations()] == ["u1"]

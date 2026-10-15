@@ -341,7 +341,7 @@ def test_reprocess_tail_removes_weak_topics_and_reports_items():
     plan = plan_reprocess(st, max_obs=1)
     assert [t["topic_id"] for t in plan.weak_topics] == ["b"] and plan.item_urls == ["b0"]
     out = execute_reprocess(st, plan)
-    assert out == {"topics_deleted": 1, "observations_deleted": 1, "item_urls": ["b0"]}
+    assert out == {"topics_deleted": 1, "observations_deleted": 1, "topics_skipped": [], "item_urls": ["b0"]}
     assert st.get_topic("b") is None and st.get_topic("a") is not None
 
 

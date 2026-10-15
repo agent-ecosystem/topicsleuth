@@ -5,13 +5,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from topicsleuth.embeddings import (
-    crossed_refresh_threshold,
+    refresh_owed,
     refresh_topic_embedding,
 )
-from topicsleuth.interfaces import DuplicateObservation, DuplicateTopic, Embedder, ItemFailure, Store
+from topicsleuth.interfaces import DestinationNotLive, DuplicateObservation, DuplicateTopic, Embedder, ItemFailure, Store
 from topicsleuth.rubric import DEFAULT_CONNECTION_TYPE
 from topicsleuth.settings import Settings, load_settings
-from topicsleuth.synthesize import ItemEval, Link, SynthesisDecision, intended_links
+from topicsleuth.history import removed_history
+from topicsleuth.synthesize import ItemEval, Link, SynthesisDecision, _live_successor, intended_links
 
 logger = logging.getLogger(__name__)
 
@@ -213,9 +214,6 @@ def record(
     affected_topics: set[str] = set()
     # Latest observation date per topic in this batch; the snapshot's "now".
     batch_dates: dict[str, datetime] = {}
-    # Observation totals before this batch touched each topic, for the
-    # embedding-refresh thresholds.
-    prev_counts: dict[str, int] = {}
     # Proposals that could not be created, so no observation lands on them.
     failed_topics: set[str] = set()
 
@@ -248,6 +246,12 @@ def record(
     pending_refresh: set[str] = set()
 
     def resume(stored: dict) -> None:
+        """Pick up an observation the store already held. One its topic has
+        not snapshotted since it arrived there, whether it was recorded
+        (``recorded_at``) or moved onto the topic by a repair
+        (``relocated_at``, which the move stamps: the topic's count changed
+        then, whatever older evidence the observation is), gets the
+        derived work of a new observation."""
         result.already_recorded.append(stored)
         topic_id = stored.get("topic_id")
         topic = store.get_topic(topic_id) if topic_id else None
@@ -255,10 +259,24 @@ def record(
             return
         snapshots = topic.get("snapshots") or []
         stamps = [s.get("recorded_at") for s in snapshots if s.get("recorded_at")]
-        snapshotted = stored.get("recorded_at") and stamps and max(stamps) >= stored["recorded_at"]
+        arrived = max((t for t in (stored.get("recorded_at"), stored.get("relocated_at")) if t), default=None)
+        snapshotted = arrived and stamps and max(stamps) >= arrived
+        # An observation moved onto the topic owes it a refresh until a
+        # refresh that included its embedding has been written: every
+        # refresh records its inputs, and that list, not a timestamp, is
+        # what answers the move. The obligation lives on the observation,
+        # so it survives whatever failed after the move; no snapshot and no
+        # refresh that left the item out stands in for it.
+        if stored.get("relocated_at") and not stored.get("minor") \
+                and stored.get("item_url") not in (topic.get("embedding_inputs") or []):
+            pending_refresh.add(topic_id)
+        # A threshold refresh is owed whenever the count has crossed one
+        # since the embedding was last refreshed, read from the store:
+        # whatever run inserted the evidence, and whatever it got to.
+        if refresh_owed(topic, store.count_observations_for_topic(topic_id)):
+            pending_refresh.add(topic_id)
         if not snapshotted:
-            logger.info("Observation %s was recorded without a snapshot; finishing it", stored.get("item_url"))
-            prev_counts.setdefault(topic_id, store.count_observations_for_topic(topic_id) - 1)
+            logger.info("Observation %s arrived on %s without a snapshot since; finishing it", stored.get("item_url"), topic_id)
             affected_topics.add(topic_id)
             d = stored.get("date") or now
             if topic_id not in batch_dates or d > batch_dates[topic_id]:
@@ -350,9 +368,22 @@ def record(
             # this item, including every link it intended. This batch's
             # decision for it, whatever it says, is not applied; what the
             # earlier run left unwritten of its own intent is written now.
-            stored = already[decision.item_url]
+            # First, an observation left on a topic that was merged as it
+            # landed is put where the merge would have put it; where it is
+            # is not taken as proof that the decision is complete.
+            try:
+                stored, blocked = _rehome_stranded(store, already[decision.item_url], decision.item_url, now, fail)
+            except Exception as e:
+                # The store failed mid-repair. Whatever it had committed is
+                # self-describing (the move carries its stamp), so a fresh
+                # run picks the repair up; this item fails, the rest go on.
+                logger.error("Failed to repair the stored observations of %s", decision.item_url, exc_info=True)
+                fail(decision.item_url, "relocate", e)
+                continue
             for o in stored:
                 resume(o)
+            if blocked:
+                continue
             present = {o.get("topic_id") for o in stored}
             intended = intended_links(stored, store)
             missing = [l for l in intended if l.topic_id not in present]
@@ -368,7 +399,7 @@ def record(
                     _record_link(
                         store, result, earlier, link, item, stored[0].get("date") or obs_date, now,
                         bool(stored[0].get("backfill")), run_id,
-                        failed_topics, prev_counts, affected_topics, batch_dates, resume, fail, settings,
+                        failed_topics, affected_topics, batch_dates, resume, fail, settings,
                     )
             continue
 
@@ -383,13 +414,16 @@ def record(
         for link in links:
             _record_link(
                 store, result, decision, link, item, obs_date, now, backfill, run_id,
-                failed_topics, prev_counts, affected_topics, batch_dates, resume, fail, settings,
+                failed_topics, affected_topics, batch_dates, resume, fail, settings,
             )
 
-    # 3. Save embeddings on item documents (only for items that got this far)
-    failed = result.failed_urls()
+    # 3. Save embeddings on item documents. An item whose observation is in
+    #    the store owes its embedding to that topic's centroid, whatever
+    #    else failed for it; an item with no observation written is left
+    #    untouched.
+    persisted = {o["item_url"] for o in result.observations_created + result.already_recorded}
     for eval_result in eval_results:
-        if eval_result.url in failed:
+        if eval_result.url not in persisted:
             continue
         try:
             store.save_item_embedding(eval_result.url, eval_result.embedding)
@@ -397,9 +431,9 @@ def record(
             logger.error("Failed to save embedding for %s", eval_result.url, exc_info=True)
             fail(eval_result.url, "save_embedding", e)
 
-    # Items whose embedding this run could not save: a refresh that would
-    # read them is deferred until a retry has saved them.
-    embed_failed = {f.item_url for f in result.failures if f.stage == "save_embedding"}
+    # Inputs owed and not in the store, however that came about: a refresh
+    # that would read them is deferred until a retry has saved them.
+    embed_failed = persisted - set(store.get_item_embeddings(sorted(persisted))) if persisted else set()
 
     # 4. Compute and append snapshots to affected topics, detect transitions,
     #    refresh embeddings on evidence-count threshold crossings.
@@ -453,7 +487,7 @@ def record(
                 store.update_topic(topic_id, {"date_identified": earliest})
 
         new_count = store.count_observations_for_topic(topic_id)
-        if crossed_refresh_threshold(prev_counts.get(topic_id, 0), new_count) or topic.get("embedding_refresh_pending"):
+        if refresh_owed(topic, new_count) or topic.get("embedding_refresh_pending") or topic_id in pending_refresh:
             _refresh_or_defer(store, topic_id, settings, embedder, urls_here, fail, embed_failed)
         pending_refresh.discard(topic_id)
 
@@ -506,31 +540,52 @@ def record(
 
 def _refresh_or_defer(store: Store, topic_id: str, settings: Settings, embedder: Embedder | None,
                       urls: list[str], fail, embed_failed: set[str] = frozenset()) -> None:
-    """Refresh a topic's embedding now, or leave ``embedding_refresh_pending``
-    on the topic so the next run that touches it tries again. The threshold
-    crossing that asked for the refresh happens once; the flag is what
-    survives a failure. A failed attempt fails the items that caused it.
-    A refresh is not attempted while an item embedding this run owes the
-    topic is unsaved: it would be computed from incomplete inputs and then
-    look finished."""
-    unsaved = sorted(set(urls) & set(embed_failed))
-    if unsaved:
-        logger.warning("Topic %s needs an embedding refresh but %s have no saved embedding yet; deferred", topic_id, unsaved)
-        store.update_topic(topic_id, {"embedding_refresh_pending": True})
-        return
-    if embedder is None:
-        logger.warning("Topic %s needs an embedding refresh but no embedder was given; deferred", topic_id)
-        store.update_topic(topic_id, {"embedding_refresh_pending": True})
-        return
+    """Refresh a topic's embedding now, or leave the obligation registered
+    on the topic (``embedding_refresh_pending``) so the next run that
+    touches it tries again. The registration is a convenience, not the
+    record: whether a threshold refresh is owed is read from the store
+    (``refresh_owed``, against the count the embedding was last refreshed
+    at), so an interruption or a failed registration loses nothing.
+
+    A refresh computed from incomplete inputs never looks finished: the
+    refresh publishes, in the same write as its embedding, every input it
+    wanted and could not load, whether that input's writer failed to save
+    it or is still saving it. Inputs this batch failed to save are
+    registered first (``Store.defer_topic_refresh``, which merges them
+    into ``embedding_refresh_missing`` without dropping what other batches
+    registered), in case the refresh does not get as far as publishing.
+    Registration bumps the same revision publication is conditional on,
+    and publication sets the obligation only inside that compare-and-swap,
+    so a refresh settles exactly the obligation it knew of, never one
+    registered while it computed or after it published.
+
+    A failed attempt, including a refresh that could not publish because
+    other publications kept landing first (``RefreshConflict``), fails the
+    items that caused it and leaves the obligation, so nothing is
+    acknowledged on a result that did not commit."""
+    unsaved_here = sorted(set(urls) & set(embed_failed))
     try:
+        if unsaved_here:
+            logger.warning("Topic %s needs an embedding refresh but %s have no saved embedding yet; registered", topic_id, unsaved_here)
+            store.defer_topic_refresh(topic_id, unsaved_here)
+        if embedder is None:
+            logger.warning("Topic %s needs an embedding refresh but no embedder was given; deferred", topic_id)
+            store.defer_topic_refresh(topic_id, [])
+            return
         refreshed = refresh_topic_embedding(topic_id, store, settings, embedder)
+        if not refreshed:
+            store.defer_topic_refresh(topic_id, [])
     except Exception as e:
+        # The refresh, or registering that it is owed, failed. The items
+        # fail and retry; what is owed is read from the store next time
+        # whether or not the registration below lands.
         logger.error("Failed to refresh embedding for topic %s; deferred", topic_id, exc_info=True)
-        store.update_topic(topic_id, {"embedding_refresh_pending": True})
+        try:
+            store.defer_topic_refresh(topic_id, [])
+        except Exception:
+            logger.error("Could not register the owed refresh of %s either", topic_id, exc_info=True)
         for url in urls:
             fail(url, "embedding_refresh", e)
-        return
-    store.update_topic(topic_id, {"embedding_refresh_pending": not refreshed})
 
 
 def _rebuild_later_snapshots(store: Store, topic_id: str, after: datetime) -> None:
@@ -563,8 +618,71 @@ def _apply_transition(store: Store, result: RecordResult, transition: dict) -> N
     )
 
 
+def _rehome_stranded(store: Store, stored: list[dict], url: str, now: datetime, fail) -> tuple[list[dict], bool]:
+    """Observations an item holds on retired merge sources: a write that
+    landed on a topic as it was being merged, too late for the merge's own
+    sweep, whose relocation did not finish. Each is moved to the live
+    successor, folded into the item's observation there if it has one, as
+    the merge would have done. A successor that is marked for deletion
+    blocks the item: it fails, and the observation waits where it is as
+    the durable record of the decision. One with no live successor at all
+    is withdrawn and the item fails, to be judged again. A move stamps
+    ``relocated_at`` on the observation, in the same write: the
+    destination's count changed then, and the stamp is the whole record
+    of what is owed for it. The snapshot is owed until one postdates the
+    stamp, and the refresh until one that included the item's embedding
+    has been written (``embedding_inputs`` on the topic), whichever run
+    gets to do them; there is no second write to register either, so
+    nothing that fails after the move can lose them.
+    Returns the item's observations as they now stand, less any still
+    stranded, and whether the item is blocked."""
+    blocked = changed = False
+    stranded: set = set()
+    for o in stored:
+        topic = store.get_topic(o.get("topic_id") or "")
+        if not topic or topic.get("status") != "retired" or not topic.get("merged_into"):
+            continue
+        tid = topic["topic_id"]
+        successor = _live_successor(topic["merged_into"], store)
+        if successor is None:
+            store.delete_observation(o["_id"])
+            changed = True
+            fail(url, "create_observation", f"observation on retired topic {tid!r} has no live successor; withdrawn to be judged again")
+            continue
+        day = now.date().isoformat()
+        try:
+            try:
+                store.update_observation(o["_id"], {
+                    "topic_id": successor, "moved_from": tid, "removed_from": removed_history(o, tid), "relocated_at": now,
+                    "reasoning_trace": (o.get("reasoning_trace") or "")
+                    + f"\n\nMOVED by record on {day}: '{tid}' had been merged into '{successor}' when this landed.",
+                })
+            except DuplicateObservation:
+                _fold_into_holder(store, o, successor, url, f"this item's observation on '{tid}' (strength {o.get('strength')}, "
+                                  f"{o.get('connection_type')}) landed as that topic was merged into this one.", now)
+        except DestinationNotLive as e:
+            blocked = True
+            stranded.add(o["_id"])
+            fail(url, "create_observation", f"observation on retired topic {tid!r} belongs on {successor!r}, which is not live ({e}); left for the next run")
+            continue
+        changed = True
+        logger.warning("Observation for %s had been left on retired topic %s; moved to %s", url, tid, successor)
+    current = store.get_observations_for_item(url) if changed else stored
+    return [o for o in current if o["_id"] not in stranded], blocked
+
+
+def _fold_into_holder(store: Store, obs: dict, topic_id: str, url: str, why: str, now: datetime) -> dict:
+    """Fold ``obs`` into the item's observation on ``topic_id``. The store
+    gives the survivor the union of the two plans and histories, read at
+    the moment of the write, so a link only the folded observation carried
+    is not lost with it. Returns the holder as it was read."""
+    holder = next(h for h in store.get_observations_for_item(url) if h.get("topic_id") == topic_id)
+    store.fold_observation(obs["_id"], holder["_id"], f"\n\nFOLDED by record on {now.date().isoformat()}: {why}")
+    return holder
+
+
 def _record_link(store, result, decision, link, item, obs_date, now, backfill, run_id,
-                 failed_topics, prev_counts, affected_topics, batch_dates, resume, fail, settings) -> None:
+                 failed_topics, affected_topics, batch_dates, resume, fail, settings) -> None:
     """Write one observation: the item as evidence for one topic."""
     topic_id = link.topic_id
     if not topic_id:
@@ -586,7 +704,6 @@ def _record_link(store, result, decision, link, item, obs_date, now, backfill, r
         return
 
     evidence_count = store.count_observations_for_topic(topic_id)
-    prev_counts.setdefault(topic_id, evidence_count)
 
     # Flag weak observations for well-evidenced topics as minor
     strength = link.strength if link.strength is not None else 0.7
@@ -660,26 +777,36 @@ def _record_link(store, result, decision, link, item, obs_date, now, backfill, r
     # withdrawn and the item fails, so nothing is stranded.
     landed = store.get_topic(topic_id)
     if landed is None or landed.get("status") in ("retired", "deleting"):
-        target = (landed or {}).get("merged_into")
-        target_topic = store.get_topic(target) if target else None
-        if target_topic and target_topic.get("status") != "retired":
+        target = _live_successor(landed["merged_into"], store) if landed and landed.get("merged_into") else None
+        if target is not None:
             try:
-                store.update_observation(obs_id, {
-                    "topic_id": target, "moved_from": topic_id,
-                    "reasoning_trace": obs_doc["reasoning_trace"]
-                    + f"\n\nMOVED by record on {now.date().isoformat()}: '{topic_id}' was merged into '{target}' during the write.",
-                })
-            except DuplicateObservation:
-                # The item was already evidence on the merge target.
-                store.delete_observation(obs_id)
-                stored = [o for o in store.get_observations_for_item(decision.item_url) if o.get("topic_id") == target]
-                if stored:
-                    resume(stored[0])
+                try:
+                    store.update_observation(obs_id, {
+                        "topic_id": target, "moved_from": topic_id, "removed_from": removed_history(obs_doc, topic_id),
+                        "reasoning_trace": obs_doc["reasoning_trace"]
+                        + f"\n\nMOVED by record on {now.date().isoformat()}: '{topic_id}' was merged into '{target}' during the write.",
+                    })
+                except DuplicateObservation:
+                    # The item was already evidence on the merge target:
+                    # ours is folded into that observation, plan included,
+                    # so a link this decision intends and that one did not
+                    # is kept.
+                    holder = _fold_into_holder(store, {**obs_doc, "_id": obs_id}, target, decision.item_url,
+                                               f"this item's observation on '{topic_id}' landed as that topic was merged into this one.", now)
+                    resume(holder)
+                    return
+            except DestinationNotLive as e:
+                # The successor is leased for deletion. The observation
+                # stays where it landed, on the retired source, as the
+                # durable record of the decision; the item fails, and the
+                # next run re-homes it once the lease is resolved.
+                fail(decision.item_url, "create_observation",
+                     f"topic {topic_id!r} was merged into {target!r} during the write, and {target!r} is not live ({e}); "
+                     f"the observation waits on {topic_id!r}")
                 return
             logger.warning("Topic %s was merged during the write; observation for %s moved to %s", topic_id, decision.item_url, target)
             obs_doc = {**obs_doc, "topic_id": target, "moved_from": topic_id}
             topic_id = target
-            prev_counts.setdefault(topic_id, store.count_observations_for_topic(topic_id) - 1)
         else:
             store.delete_observation(obs_id)
             what = "deleted" if landed is None else ("retired" if landed.get("status") == "retired" else "marked for deletion")

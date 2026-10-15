@@ -95,13 +95,19 @@ def intended_links(observations: list[dict], store: Store) -> list[Link]:
     those copies is the plan. A plan is not revised by curation, so it is
     read against curation's own marks:
 
-    - a topic any of the item's observations was ``moved_from`` or
-      ``folded_from`` was deliberately taken off the item (a move, merge
-      or split); it is not unfinished work, whatever the plan says;
+    - a topic in any of the item's observations' ``removed_from`` history
+      was deliberately taken off the item (by a move, merge, fold, split or
+      reprocess, however many steps ago); it is not unfinished work,
+      whatever the plan says;
     - a planned topic the item is not yet on is followed through merges
       (``merged_into``) to its live successor, and dropped if that successor
-      is already present, or if the topic was deleted, retired by a split,
-      or is being deleted.
+      is already present, or if the topic was deleted or retired by a
+      split. A topic that is only marked ``deleting`` is blocked, not
+      removed: the link is kept, and recording fails the item until the
+      mark is resolved, so an incomplete decision never looks complete;
+    - an observation the item holds on a retired merge source (it landed
+      as the topic was merged, and its relocation did not finish) stands
+      for the live successor, where recording puts it before trusting it.
 
     The result is every link the item has, plus every planned link that is
     still writable and was not removed on purpose, in first-seen order."""
@@ -114,9 +120,7 @@ def intended_links(observations: list[dict], store: Store) -> list[Link]:
             present[tid] = Link(topic_id=tid, connection_type=o.get("connection_type") or DEFAULT_CONNECTION_TYPE,
                                 strength=o.get("strength") if o.get("strength") is not None else 0.0,
                                 fit_questions=o.get("fit_questions"))
-        if o.get("moved_from"):
-            removed.add(o["moved_from"])
-        removed.update(o.get("folded_from") or [])
+        removed.update(o.get("removed_from") or [])
         for l in o.get("decision_links") or []:
             pid = l.get("topic_id")
             if pid and pid not in planned:
@@ -124,7 +128,15 @@ def intended_links(observations: list[dict], store: Store) -> list[Link]:
                                     strength=l.get("strength") if l.get("strength") is not None else 0.0,
                                     fit_questions=l.get("fit_questions"))
 
-    links: dict[str, Link] = dict(present)
+    links: dict[str, Link] = {}
+    for pid, link in present.items():
+        topic = store.get_topic(pid)
+        target = pid
+        if topic and topic.get("status") == "retired" and topic.get("merged_into"):
+            target = _live_successor(topic["merged_into"], store) or pid
+        if target not in links:
+            links[target] = Link(topic_id=target, connection_type=link.connection_type,
+                                 strength=link.strength, fit_questions=link.fit_questions)
     for pid, link in planned.items():
         if pid in links or pid in removed:
             continue
@@ -138,12 +150,13 @@ def intended_links(observations: list[dict], store: Store) -> list[Link]:
 
 def _live_successor(topic_id: str, store: Store) -> str | None:
     """Follow merges to the topic that now holds what ``topic_id`` tracked.
-    None if it was deleted, is being deleted, or was retired by a split."""
+    None if it was deleted or retired by a split. A topic marked
+    ``deleting`` is returned as it is: temporarily blocked, not gone."""
     seen: set[str] = set()
     while topic_id and topic_id not in seen:
         seen.add(topic_id)
         topic = store.get_topic(topic_id)
-        if topic is None or topic.get("status") == "deleting":
+        if topic is None:
             return None
         if topic.get("status") != "retired":
             return topic_id

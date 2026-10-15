@@ -14,6 +14,7 @@ from topicsleuth.rubric import (
     split_reassign_system_prompt,
 )
 from topicsleuth.settings import Settings
+from topicsleuth.history import removed_history
 from topicsleuth.synthesize import _cosine, _sanitize_topic_id
 
 logger = logging.getLogger(__name__)
@@ -57,8 +58,8 @@ def split_topic(
     topic = store.get_topic(topic_id)
     if not topic:
         raise ValueError(f"Topic not found: {topic_id}")
-    if topic.get("status") == "retired":
-        raise ValueError(f"Topic is retired: {topic_id}")
+    if topic.get("status") in ("retired", "deleting"):
+        raise ValueError(f"Topic is {topic['status']}: {topic_id}")
 
     observations = store.get_observations_for_topic(topic_id)
     if not observations:
@@ -131,6 +132,7 @@ def split_topic(
             "fit_questions": r.get("fit_questions"),
             "reasoning_trace": (original.get("reasoning_trace") or "") + note,
             "moved_from": topic_id,
+            "removed_from": removed_history(original, topic_id),
         }
         store.update_observation(original["_id"], updates)
         moved += 1
@@ -160,7 +162,7 @@ def split_topic(
                 target = max(counts, key=counts.get)
                 how = "largest sub-topic (item has no embedding)"
             store.update_observation(o["_id"], {
-                "topic_id": target, "moved_from": topic_id,
+                "topic_id": target, "moved_from": topic_id, "removed_from": removed_history(o, topic_id),
                 "reasoning_trace": (o.get("reasoning_trace") or "")
                 + f"\n\nMOVED by split-topic on {now.date().isoformat()}: arrived during the split; {how}: '{target}'.",
             })

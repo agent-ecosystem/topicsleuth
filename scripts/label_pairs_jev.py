@@ -44,7 +44,7 @@ LABELS = list(RELATIONSHIP_LABELS)
 
 
 def state_for(p: dict) -> dict:
-    it, th = p["item"], (p.get("topic") or p["theme"])  # pairs.json predates the rename
+    it, th = p["item"], p["topic"]
     return {
         "item": {
             "title": it["title"],

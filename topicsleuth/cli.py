@@ -104,7 +104,9 @@ def _recover_deletions(store) -> None:
     from topicsleuth.reprocess import recover_interrupted_deletions
     out = recover_interrupted_deletions(store)
     if out["restored"] or out["deleted"]:
-        print(f"Recovered an interrupted deletion: restored {out['restored']}, deleted {out['deleted']}")
+        print(f"Recovered an abandoned deletion: restored {out['restored']}, deleted {out['deleted']}")
+    if out["busy"]:
+        print(f"Another maintenance operation holds {out['busy']}; left alone")
 
 
 def cmd_clean(args):

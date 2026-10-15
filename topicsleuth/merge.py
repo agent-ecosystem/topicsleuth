@@ -132,6 +132,8 @@ def merge_topics(
             f"(merged_into={source.get('merged_into')}, "
             f"split_into={source.get('split_into')})"
         )
+    if target.get("status") == "deleting":
+        raise ValueError(f"target topic is being deleted: {target_topic_id}")
     if target.get("status") == "retired":
         raise ValueError(
             f"target topic is retired and cannot be merged into: {target_topic_id}"
