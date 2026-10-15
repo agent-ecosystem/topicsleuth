@@ -12,6 +12,7 @@ import pytest
 
 from topicsleuth.backends.fake import HashEmbedder, ScriptedDecisionModel, ScriptedJudge
 from topicsleuth.backends.memory import MemoryStore
+from topicsleuth.interfaces import Completion
 from topicsleuth.record import record
 from topicsleuth.settings import load_settings
 from topicsleuth.synthesize import (
@@ -210,6 +211,46 @@ def test_unparseable_judge_output_is_reported_not_recorded(caplog):
     decisions = synthesize_items([_item()], [_Eval("u1", E_A)], _store(), _settings(), judge, HashEmbedder(DIM))
     assert len(decisions) == 1 and decisions[0].decision == "failed" and "JSONDecodeError" in decisions[0].error
     assert "Failed to synthesize item" in caplog.text
+
+
+def test_first_pass_cut_off_at_max_tokens_is_reported_as_truncation_not_a_parse_error():
+    # Issue #3: with vector_limit candidates each classified and questioned,
+    # the first-pass JSON outgrew the cap and surfaced as a parse error.
+    cut = Completion(text='{\n  "candidate_classifications": [\n    {\n      "topic_id": "a",\n      "candidate_que',
+                     input_tokens=900, output_tokens=2048, truncated=True)
+    st = _store()
+    decisions = synthesize_items([_item()], [_Eval("u1", E_A)], st, _settings(), ScriptedJudge([cut]), HashEmbedder(DIM))
+    d = decisions[0]
+    assert d.decision == "failed" and d.error == "JudgeTruncated: judge reply for the first-pass decision was truncated at 2048 output tokens; raise settings judge.first_pass_max_tokens"
+    assert "JSONDecodeError" not in d.error and st.get_observations_for_item("u1") == []
+
+
+def test_judge_calls_leave_room_for_every_shown_candidate():
+    caps = []
+
+    class _CapJudge(ScriptedJudge):
+        def complete(self, system, user, max_tokens=2048):
+            caps.append(max_tokens)
+            return super().complete(system, user, max_tokens)
+
+    synthesize_items([_item()], [_Eval("u1", E_B)], _store(), _settings(), _CapJudge([PROPOSE, CONFIRM]), HashEmbedder(DIM))
+    first_pass, confirm = caps
+    assert first_pass >= 8192, "30 candidates each with a candidate_question ran past 2048"
+    assert confirm >= 2048
+
+    caps.clear()
+    raised = _settings(judge={"first_pass_max_tokens": 32000, "confirm_max_tokens": 5000})
+    synthesize_items([_item()], [_Eval("u1", E_B)], _store(), raised, _CapJudge([PROPOSE, CONFIRM]), HashEmbedder(DIM))
+    assert caps == [32000, 5000], "a feeder raises a cap in settings, no judge subclass needed"
+    with pytest.raises(ValueError, match="unknown settings under 'judge'"):
+        _settings(judge={"first_pass": 32000})
+
+
+def test_truncated_reviewer_keeps_the_proposal_like_a_garbled_one(caplog):
+    cut = Completion(text='{"verdict": "link_existing", "topic_id": "a", "reas', truncated=True)
+    d = synthesize_items([_item()], [_Eval("u1", E_B)], _store(), _settings(), ScriptedJudge([PROPOSE, cut]), HashEmbedder(DIM))[0]
+    assert d.decision == "propose_new" and d.diagnostics["confirmation"] == "confirmed_new"
+    assert "Confirmation pass was truncated" in caplog.text
 
 
 def test_record_status_transition_and_embedding_refresh():

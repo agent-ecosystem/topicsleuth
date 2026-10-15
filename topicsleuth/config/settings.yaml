@@ -45,6 +45,17 @@ synthesize:
   # a later one scoring below this floor is dropped. 0 keeps them all.
   secondary_link_floor: 0.0
 
+judge:
+  # Output-token cap per call to the judge. A cap costs nothing until a
+  # reply reaches it; a reply that does is cut off and the call fails with
+  # JudgeTruncated, naming which cap to raise. The first pass classifies
+  # every candidate it is shown, so it grows with candidates.vector_limit.
+  first_pass_max_tokens: 8192
+  confirm_max_tokens: 2048
+  merge_max_tokens: 4096
+  split_propose_max_tokens: 4096
+  split_reassign_max_tokens: 8192
+
 record:
   # Once a topic holds minor_floor_after observations, a new one scoring
   # below minor_floor_strength is filed but marked minor.

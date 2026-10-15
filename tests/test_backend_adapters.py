@@ -76,9 +76,10 @@ class _Usage:
 
 
 class _Message:
-    def __init__(self, text):
+    def __init__(self, text, stop_reason="end_turn"):
         self.content = [_Block(text)]
         self.usage = _Usage()
+        self.stop_reason = stop_reason
 
 
 class _Messages:
@@ -104,10 +105,29 @@ def test_anthropic_judge_maps_request_and_completion():
     j = AnthropicJudge(model="claude-test", client=client)
     assert isinstance(j, Judge)
     out = j.complete("SYSTEM", "USER", max_tokens=77)
-    assert out == Completion(text="{\"decision\": \"skip\"}", input_tokens=123, output_tokens=45)
+    assert out == Completion(text="{\"decision\": \"skip\"}", input_tokens=123, output_tokens=45, truncated=False)
     call = client.calls[0]
     assert call["model"] == "claude-test" and call["max_tokens"] == 77 and call["system"] == "SYSTEM"
     assert call["messages"] == [{"role": "user", "content": "USER"}]
+
+
+def test_anthropic_judge_reports_a_reply_cut_off_at_max_tokens():
+    pytest.importorskip("anthropic")
+    from topicsleuth.backends.anthropic import AnthropicJudge
+    from topicsleuth.interfaces import JudgeTruncated
+
+    class _CutMessages(_Messages):
+        def create(self, **kwargs):
+            return _Message('{"candidate_classifications": [{"topic_id": "a", "candidate_que', stop_reason="max_tokens")
+
+    client = _AnthropicClient()
+    client.messages = _CutMessages(client)
+    out = AnthropicJudge(model="claude-test", client=client).complete("SYSTEM", "USER", max_tokens=2048)
+    assert out.truncated is True, "the backend maps its own stop_reason vocabulary to the one bit the core reads"
+    with pytest.raises(JudgeTruncated, match="first-pass decision was truncated at 45 output tokens"):
+        out.require_complete("first-pass decision")
+    assert Completion(text="{}").truncated is None, "a backend that does not say leaves it unknown"
+    assert Completion(text="{}").require_complete("anything") is not None, "unknown is not a claim of truncation"
 
 
 # ── Jev ──

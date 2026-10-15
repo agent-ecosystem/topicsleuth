@@ -544,6 +544,12 @@ synthesize:
   confirm_backend: judge               # judge | decision
   confirm_link_threshold: 0.7          # decision backend: how sure it must be to fold a proposal in
   secondary_link_floor: 0.0            # drop a document's second or later link below this strength
+judge:
+  first_pass_max_tokens: 8192          # output cap per judge call; a reply that hits one fails as JudgeTruncated
+  confirm_max_tokens: 2048             # (the first pass grows with vector_limit; raise the cap it names)
+  merge_max_tokens: 4096
+  split_propose_max_tokens: 4096
+  split_reassign_max_tokens: 8192
 record:
   minor_floor_after: 20                # from this many observations on a topic...
   minor_floor_strength: 0.7            # ...a new one below this strength is marked minor

@@ -338,6 +338,7 @@ def replay_synthesis(
                 "confirm_link_threshold": settings.synthesize.confirm_link_threshold,
                 "secondary_link_floor": settings.synthesize.secondary_link_floor,
             },
+            "judge": asdict(settings.judge),
             "record": {
                 "minor_floor_after": settings.record.minor_floor_after,
                 "minor_floor_strength": settings.record.minor_floor_strength,

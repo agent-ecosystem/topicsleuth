@@ -10,7 +10,7 @@ import pytest
 
 from topicsleuth.backends.fake import HashEmbedder, ScriptedJudge
 from topicsleuth.backends.memory import MemoryStore
-from topicsleuth.interfaces import ItemFailure, StoreError
+from topicsleuth.interfaces import Completion, ItemFailure, JudgeTruncated, StoreError
 from topicsleuth.record import record
 from topicsleuth.settings import load_settings
 from topicsleuth.synthesize import Link, SynthesisDecision, intended_links, synthesize_items
@@ -489,6 +489,39 @@ def test_merge_and_split_carry_late_arrivals_with_them():
     late = st.get_observations_for_item("late-a")[0]
     assert late["topic_id"] == "a-one" and "arrived during the split; nearest sub-topic" in late["reasoning_trace"]
     assert st.count_observations_for_topic("a") == 0 and out["observations_reassigned"] == len(plan_urls) + 1
+
+
+def test_merge_and_split_stop_before_writing_when_the_rewrite_is_cut_off():
+    from topicsleuth.merge import merge_topics
+    from topicsleuth.split import split_topic
+    st, s, emb = _store(), _settings(), HashEmbedder(DIM)
+    st.create_topic({"topic_id": "b", "title": "Topic B", "summary": "s", "embedding": E_B})
+    st.create_observation({"topic_id": "b", "item_url": "b0"})
+    before = (st.list_topics(), st.list_observations())
+
+    cut = Completion(text='{"title": "Merged A and B", "summary": "Tracks A and', output_tokens=4096, truncated=True)
+    with pytest.raises(JudgeTruncated, match="merge rewrite was truncated at 4096 output tokens"):
+        merge_topics("b", "a", st, s, ScriptedJudge([cut]), emb)
+    with pytest.raises(JudgeTruncated, match="split proposal was truncated"):
+        split_topic("a", st, s, ScriptedJudge([Completion(text='{"sub_topics": [', truncated=True)]), emb)
+    subs = {"sub_topics": [{"topic_id": "a-one", "title": "A one", "summary": "s1"}, {"topic_id": "a-two", "title": "A two", "summary": "s2"}]}
+    with pytest.raises(JudgeTruncated, match="split reassignment was truncated"):
+        split_topic("a", st, s, ScriptedJudge([subs, Completion(text='[{"item_url": "a0", "new_', truncated=True)]), emb)
+    assert (st.list_topics(), st.list_observations()) == before, "a cut-off rewrite writes nothing"
+
+    caps = []
+
+    class _CapJudge(ScriptedJudge):
+        def complete(self, system, user, max_tokens=2048):
+            caps.append(max_tokens)
+            return super().complete(system, user, max_tokens)
+
+    raised = load_settings(overrides={"domain": "widget manufacturing", "embedding": {"dimensions": DIM},
+                                      "judge": {"merge_max_tokens": 9000, "split_propose_max_tokens": 9001, "split_reassign_max_tokens": 9002}})
+    merged = {"title": "Merged", "summary": "AB.", "tags": [], "suggested_directions": [], "rationale": "r"}
+    merge_topics("b", "a", st, raised, _CapJudge([merged]), emb, dry_run=True)
+    split_topic("a", st, raised, _CapJudge([subs, []]), emb, dry_run=True)
+    assert caps == [9000, 9001, 9002]
 
 
 def test_a_backfill_recomputes_the_later_snapshots_it_lands_before():
