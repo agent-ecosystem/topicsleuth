@@ -428,7 +428,13 @@ one-off, and a notebook that has grown for months needs editing. The
 `topicsleuth` command does that against a store configured through the
 environment (`MONGODB_URI`, `TOPICSLEUTH_DATABASE`, `TOPICSLEUTH_SETTINGS`
 for your settings file, and optionally the model names; a `.env` file in
-the working directory is read). Every
+the working directory is read). A feeder that keeps its store in
+non-default collections, say because two feeders share a database and
+its `items` collection but curate their topics apart, names them with
+`TOPICSLEUTH_TOPICS_COLLECTION`, `TOPICSLEUTH_OBSERVATIONS_COLLECTION`
+and `TOPICSLEUTH_ITEMS_COLLECTION` (and the index on that topics
+collection with `TOPICSLEUTH_VECTOR_INDEX`), so the command and the
+pipeline run against the same store. Every
 command that writes takes `--dry-run` and shows the plan first.
 
 ```bash
