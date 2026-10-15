@@ -3,6 +3,10 @@ for feeders that are happy with the defaults.
 
     MONGODB_URI             connection string (required for the store)
     TOPICSLEUTH_DATABASE    database name (default: topicsleuth)
+    TOPICSLEUTH_VECTOR_INDEX             name of the vector index on the topics collection (default: topic_embedding_index)
+    TOPICSLEUTH_TOPICS_COLLECTION        default: topics
+    TOPICSLEUTH_OBSERVATIONS_COLLECTION  default: observations
+    TOPICSLEUTH_ITEMS_COLLECTION         default: items
     TOPICSLEUTH_SETTINGS    path to a settings YAML layered over the packaged defaults (read by the CLI)
     TOPICSLEUTH_JUDGE_MODEL      default claude-opus-4-8  (ANTHROPIC_API_KEY read by the SDK)
     TOPICSLEUTH_EMBEDDING_MODEL  default voyage-4         (VOYAGE_API_KEY read by the SDK)
@@ -22,6 +26,12 @@ from dataclasses import dataclass
 from topicsleuth.interfaces import DecisionModel, Embedder, Judge, Store
 from topicsleuth.settings import Settings
 
+COLLECTION_VARIABLES = {
+    "topics": "TOPICSLEUTH_TOPICS_COLLECTION",
+    "observations": "TOPICSLEUTH_OBSERVATIONS_COLLECTION",
+    "items": "TOPICSLEUTH_ITEMS_COLLECTION",
+}
+
 
 @dataclass
 class Backends:
@@ -39,9 +49,13 @@ def store_from_env(settings: Settings) -> Store:
     uri = os.environ.get("MONGODB_URI")
     if not uri:
         raise RuntimeError("MONGODB_URI is not set")
+    # Only the names that are set are passed, so the store's own defaults
+    # apply to the rest.
+    collections = {k: os.environ[v] for k, v in COLLECTION_VARIABLES.items() if os.environ.get(v)}
     return MongoStore.from_uri(
         uri,
         os.environ.get("TOPICSLEUTH_DATABASE", "topicsleuth"),
+        collections=collections or None,
         vector_index=os.environ.get("TOPICSLEUTH_VECTOR_INDEX", "topic_embedding_index"),
         num_candidates=settings.candidates.vector_num_candidates,
     )
