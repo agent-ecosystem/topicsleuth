@@ -499,14 +499,14 @@ def test_merge_and_split_stop_before_writing_when_the_rewrite_is_cut_off():
     st.create_observation({"topic_id": "b", "item_url": "b0"})
     before = (st.list_topics(), st.list_observations())
 
-    cut = Completion(text='{"title": "Merged A and B", "summary": "Tracks A and', output_tokens=4096, stop_reason="max_tokens")
+    cut = Completion(text='{"title": "Merged A and B", "summary": "Tracks A and', output_tokens=4096, truncated=True)
     with pytest.raises(JudgeTruncated, match="merge rewrite was truncated at 4096 output tokens"):
         merge_topics("b", "a", st, s, ScriptedJudge([cut]), emb)
     with pytest.raises(JudgeTruncated, match="split proposal was truncated"):
-        split_topic("a", st, s, ScriptedJudge([Completion(text='{"sub_topics": [', stop_reason="max_tokens")]), emb)
+        split_topic("a", st, s, ScriptedJudge([Completion(text='{"sub_topics": [', truncated=True)]), emb)
     subs = {"sub_topics": [{"topic_id": "a-one", "title": "A one", "summary": "s1"}, {"topic_id": "a-two", "title": "A two", "summary": "s2"}]}
     with pytest.raises(JudgeTruncated, match="split reassignment was truncated"):
-        split_topic("a", st, s, ScriptedJudge([subs, Completion(text='[{"item_url": "a0", "new_', stop_reason="max_tokens")]), emb)
+        split_topic("a", st, s, ScriptedJudge([subs, Completion(text='[{"item_url": "a0", "new_', truncated=True)]), emb)
     assert (st.list_topics(), st.list_observations()) == before, "a cut-off rewrite writes nothing"
 
     caps = []

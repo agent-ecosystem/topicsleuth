@@ -21,9 +21,10 @@ class AnthropicJudge:
             messages=[{"role": "user", "content": user}],
         )
         usage = getattr(response, "usage", None)
+        stop_reason = getattr(response, "stop_reason", None)
         return Completion(
             text=response.content[0].text,
             input_tokens=getattr(usage, "input_tokens", None),
             output_tokens=getattr(usage, "output_tokens", None),
-            stop_reason=getattr(response, "stop_reason", None),
+            truncated=None if stop_reason is None else stop_reason == "max_tokens",
         )

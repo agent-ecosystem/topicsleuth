@@ -79,19 +79,16 @@ class JudgeTruncated(RuntimeError):
 
 @dataclass
 class Completion:
-    """What a judge returned. ``stop_reason`` is ``"max_tokens"`` when the
-    reply hit the ``max_tokens`` cap, another backend-specific string when
-    it stopped for another reason, and ``None`` when the backend does not
-    report one (fakes may leave it unset)."""
+    """What a judge returned. ``truncated`` is True when the reply was cut
+    off at the ``max_tokens`` cap, False when the model finished on its
+    own, and None when the backend did not say (fakes may leave it unset).
+    Each backend maps its own vocabulary for why generation stopped to
+    this one bit; the core never sees a provider's string."""
 
     text: str
     input_tokens: int | None = None
     output_tokens: int | None = None
-    stop_reason: str | None = None
-
-    @property
-    def truncated(self) -> bool:
-        return self.stop_reason == "max_tokens"
+    truncated: bool | None = None
 
     def require_complete(self, what: str, setting: str = "max_tokens") -> "Completion":
         """Return self, or raise ``JudgeTruncated`` if the reply was cut off
@@ -108,9 +105,9 @@ class Judge(Protocol):
     """A language model asked for text: the link-or-propose decision, its
     reviewer, and the title and summary rewrites that merge and split make.
     ``model`` is informational, for replay reports. ``complete`` should set
-    ``Completion.stop_reason`` to ``"max_tokens"`` when the reply was cut
-    off at the cap, so callers can tell a truncation from a malformed reply.
-    The caps callers pass are generous: an output-token cap costs nothing
+    ``Completion.truncated`` from whatever the provider reports about why
+    generation stopped, so callers can tell a reply cut off at the cap from
+    a malformed one. The caps callers pass are generous: an output-token cap costs nothing
     until the reply reaches it."""
 
     model: str

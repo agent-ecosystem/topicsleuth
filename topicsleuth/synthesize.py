@@ -879,7 +879,7 @@ def _confirm_proposal(
     # The reviewer is advisory: a reply it could not finish, like one it
     # garbled, leaves the first-pass proposal standing.
     if response.truncated:
-        logger.warning("Confirmation pass was truncated at max_tokens; keeping propose_new")
+        logger.warning("Confirmation pass was truncated at its output cap; keeping propose_new")
         confirm = {"verdict": "confirm_new", "reasoning": "(truncated reviewer response)"}
     else:
         try:

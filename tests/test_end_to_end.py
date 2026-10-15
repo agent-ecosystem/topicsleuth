@@ -217,7 +217,7 @@ def test_first_pass_cut_off_at_max_tokens_is_reported_as_truncation_not_a_parse_
     # Issue #3: with vector_limit candidates each classified and questioned,
     # the first-pass JSON outgrew the cap and surfaced as a parse error.
     cut = Completion(text='{\n  "candidate_classifications": [\n    {\n      "topic_id": "a",\n      "candidate_que',
-                     input_tokens=900, output_tokens=2048, stop_reason="max_tokens")
+                     input_tokens=900, output_tokens=2048, truncated=True)
     st = _store()
     decisions = synthesize_items([_item()], [_Eval("u1", E_A)], st, _settings(), ScriptedJudge([cut]), HashEmbedder(DIM))
     d = decisions[0]
@@ -247,7 +247,7 @@ def test_judge_calls_leave_room_for_every_shown_candidate():
 
 
 def test_truncated_reviewer_keeps_the_proposal_like_a_garbled_one(caplog):
-    cut = Completion(text='{"verdict": "link_existing", "topic_id": "a", "reas', stop_reason="max_tokens")
+    cut = Completion(text='{"verdict": "link_existing", "topic_id": "a", "reas', truncated=True)
     d = synthesize_items([_item()], [_Eval("u1", E_B)], _store(), _settings(), ScriptedJudge([PROPOSE, cut]), HashEmbedder(DIM))[0]
     assert d.decision == "propose_new" and d.diagnostics["confirmation"] == "confirmed_new"
     assert "Confirmation pass was truncated" in caplog.text

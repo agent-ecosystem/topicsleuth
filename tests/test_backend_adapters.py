@@ -105,8 +105,7 @@ def test_anthropic_judge_maps_request_and_completion():
     j = AnthropicJudge(model="claude-test", client=client)
     assert isinstance(j, Judge)
     out = j.complete("SYSTEM", "USER", max_tokens=77)
-    assert out == Completion(text="{\"decision\": \"skip\"}", input_tokens=123, output_tokens=45, stop_reason="end_turn")
-    assert not out.truncated
+    assert out == Completion(text="{\"decision\": \"skip\"}", input_tokens=123, output_tokens=45, truncated=False)
     call = client.calls[0]
     assert call["model"] == "claude-test" and call["max_tokens"] == 77 and call["system"] == "SYSTEM"
     assert call["messages"] == [{"role": "user", "content": "USER"}]
@@ -124,10 +123,11 @@ def test_anthropic_judge_reports_a_reply_cut_off_at_max_tokens():
     client = _AnthropicClient()
     client.messages = _CutMessages(client)
     out = AnthropicJudge(model="claude-test", client=client).complete("SYSTEM", "USER", max_tokens=2048)
-    assert out.stop_reason == "max_tokens" and out.truncated
+    assert out.truncated is True, "the backend maps its own stop_reason vocabulary to the one bit the core reads"
     with pytest.raises(JudgeTruncated, match="first-pass decision was truncated at 45 output tokens"):
         out.require_complete("first-pass decision")
-    assert Completion(text="{}").require_complete("anything") is not None, "no stop reason means no claim either way"
+    assert Completion(text="{}").truncated is None, "a backend that does not say leaves it unknown"
+    assert Completion(text="{}").require_complete("anything") is not None, "unknown is not a claim of truncation"
 
 
 # ── Jev ──
