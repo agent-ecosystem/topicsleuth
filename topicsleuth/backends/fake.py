@@ -55,13 +55,17 @@ class ScriptedJudge:
     scripts a truncated reply. Every call is recorded in ``calls`` as
     ``(system, user)``."""
 
-    def __init__(self, script: Iterable[str | dict] | Callable[[str, str], str | dict] = (), model: str = "scripted"):
+    def __init__(
+        self,
+        script: Iterable[str | dict | Completion] | Callable[[str, str], str | dict | Completion] = (),
+        model: str = "scripted",
+    ):
         self.model = model
         self._fn = script if callable(script) else None
         self._queue = list(script) if not callable(script) else []
         self.calls: list[tuple[str, str]] = []
 
-    def queue(self, *items: str | dict) -> "ScriptedJudge":
+    def queue(self, *items: str | dict | Completion) -> "ScriptedJudge":
         """Append completions to the script. Returns self for chaining."""
         self._queue.extend(items)
         return self
