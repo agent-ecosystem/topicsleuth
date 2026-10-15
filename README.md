@@ -1,5 +1,10 @@
 # topicsleuth
 
+[![Tests](https://github.com/agent-ecosystem/topicsleuth/actions/workflows/test.yml/badge.svg)](https://github.com/agent-ecosystem/topicsleuth/actions/workflows/test.yml)
+[![PyPI](https://img.shields.io/pypi/v/topicsleuth)](https://pypi.org/project/topicsleuth/)
+[![Python](https://img.shields.io/pypi/pyversions/topicsleuth)](https://pypi.org/project/topicsleuth/)
+[![License: MIT](https://img.shields.io/pypi/l/topicsleuth)](https://github.com/agent-ecosystem/topicsleuth/blob/main/LICENSE)
+
 You're interested in something specific. New content arrives every day:
 papers, release notes, posts, discussion threads. topicsleuth remembers
 them for you. It works out which ongoing question each new document
