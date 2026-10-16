@@ -1227,8 +1227,10 @@ def synthesize_items(
 
     # The live topic list is read once for the batch: record runs after
     # synthesize, so nothing within the batch adds to it but this batch's
-    # own proposals, and those are passed on their own.
-    topics = store.list_topics(include_retired=False, fields=TOPIC_HEAD_FIELDS)
+    # own proposals, and those are passed on their own. It is read inside
+    # the per-item try, so a store failure fails that item, as any read
+    # did, and the next item reads again.
+    topics: list[dict] | None = None
 
     for i, (item, eval_result) in enumerate(above_threshold, 1):
         logger.info(
@@ -1253,6 +1255,8 @@ def synthesize_items(
             ))
             continue
         try:
+            if topics is None:
+                topics = store.list_topics(include_retired=False, fields=TOPIC_HEAD_FIELDS)
             decision = synthesize_item(
                 item, eval_result, store, settings, judge, proposed_topics,
                 decision_model=decision_model, topics=topics,

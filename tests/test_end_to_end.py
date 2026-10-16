@@ -132,6 +132,23 @@ def test_hot_paths_declare_their_fields_and_list_topics_once_per_batch():
     assert "A evidence 0" in st.get_observations_for_item("a0")[0]["item_title"], "whole documents are still there to read"
 
 
+def test_a_failed_topic_list_fails_that_item_and_the_next_item_reads_again():
+    class _ListFailsOnce(MemoryStore):
+        failed = False
+
+        def list_topics(self, include_retired=True, *, fields=None):
+            if not self.failed:
+                self.failed = True
+                raise RuntimeError("store down")
+            return super().list_topics(include_retired, fields=fields)
+
+    st = _store(_ListFailsOnce())
+    items, evals = [_item("u1"), _item("u2")], [_Eval("u1", E_A), _Eval("u2", E_A)]
+    decisions = synthesize_items(items, evals, st, _settings(), ScriptedJudge([LINK]), HashEmbedder(DIM))
+    assert [d.decision for d in decisions] == ["failed", "link_existing"]
+    assert "store down" in decisions[0].error and decisions[1].topic_id == "a"
+
+
 def test_below_threshold_items_are_not_synthesized():
     judge = ScriptedJudge([])
     assert synthesize_items([_item()], [_Eval("u1", E_A, above=False)], _store(), _settings(), judge, HashEmbedder(DIM)) == []
