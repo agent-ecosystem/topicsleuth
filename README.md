@@ -517,7 +517,13 @@ two documents (deleting a leased topic's entries, moving or folding an
 entry onto a topic that must still be live). The docstrings on the
 protocol say which, and the store contract test in the source tree is the
 specification: an adapter that passes it will behave under retries and
-concurrent writers the way the defaults do. Defaults for Voyage, Anthropic,
+concurrent writers the way the defaults do. Three of its reads
+(`list_topics`, `nearest_topics` and `get_observations_for_topic`) take a
+`fields` keyword naming what the caller will read, and a store returns
+exactly those fields plus the document's identity; that is how the
+synthesize and record paths avoid transferring every topic's embedding and
+every observation's reasoning trace, which they never look at. A store
+with no native projection filters what it fetched. Defaults for Voyage, Anthropic,
 MongoDB Atlas and TypeSafe Jev are included as extras (`voyage`,
 `anthropic`, `mongo`), and the core package itself depends only on pyyaml,
 numpy and python-dotenv.

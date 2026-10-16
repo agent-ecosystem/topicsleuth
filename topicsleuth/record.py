@@ -83,12 +83,21 @@ class RecordResult:
         return {f.item_url for f in self.failures}
 
 
+# What record reads of a quiet topic and of a topic's observations,
+# declared to the store (the ``fields`` of ``Store.list_topics`` and
+# ``get_observations_for_topic``) so it ships nothing else: a snapshot is
+# counts over dates and sources, and the quiet-topic pass needs the status,
+# the dates and the title a transition is reported with.
+QUIET_TOPIC_FIELDS = ("topic_id", "title", "status", "date_identified", "snapshots")
+SNAPSHOT_FIELDS = ("date", "source_name", "source_type")
+
+
 def _compute_snapshot(store: Store, topic_id: str, now: datetime) -> dict:
     """The topic as of ``now``: only evidence dated at or before it counts,
     so a snapshot taken for a historical date reads as history even when
     the store already holds newer observations."""
     observations = [
-        o for o in store.get_observations_for_topic(topic_id)
+        o for o in store.get_observations_for_topic(topic_id, fields=SNAPSHOT_FIELDS)
         if not o.get("date") or o["date"] <= now
     ]
     evidence_count = len(observations)
@@ -514,7 +523,7 @@ def record(
     #    spell does not pile up identical snapshots.
     as_of = max(batch_dates.values(), default=None) if date_from_item else now
     if as_of is not None:
-        for topic in store.list_topics(include_retired=False):
+        for topic in store.list_topics(include_retired=False, fields=QUIET_TOPIC_FIELDS):
             topic_id = topic["topic_id"]
             if topic_id in affected_topics or topic_id in resumed_status:
                 continue

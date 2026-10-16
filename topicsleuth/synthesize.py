@@ -213,6 +213,15 @@ def _get_evidence_count(topic: dict) -> int:
 
 OBSERVATION_SAMPLE_SIZE = 3
 
+# What synthesize reads of a topic and of a topic's observations, declared
+# to the store (the ``fields`` of ``Store.list_topics``, ``nearest_topics``
+# and ``get_observations_for_topic``) so a store that pays per byte ships
+# no embeddings or reasoning traces that nothing here looks at. A topic's
+# head is what the prompt shows of it plus what candidate selection
+# filters on; an observation's title row is what ranks and names it.
+TOPIC_HEAD_FIELDS = ("topic_id", "title", "summary", "status", "tags", "snapshots")
+OBSERVATION_TITLE_FIELDS = ("item_url", "item_title", "strength", "minor", "date")
+
 # How many of the current batch's proposed topics to show as candidates for a
 # later item in the same batch. They are not in the vector index yet, so they
 # are ranked here by cosine against the item embedding.
@@ -262,7 +271,7 @@ def _representative_observation_titles(
     (used by the tuning harness so a replayed item cannot see itself).
     """
     try:
-        observations = store.get_observations_for_topic(topic_id)
+        observations = store.get_observations_for_topic(topic_id, fields=OBSERVATION_TITLE_FIELDS)
     except Exception:
         return []
     if exclude_item_url:
@@ -981,8 +990,16 @@ def synthesize_item(
     proposed_topics: list[dict],
     leave_one_out: bool = False,
     decision_model: DecisionModel | None = None,
+    topics: list[dict] | None = None,
 ) -> SynthesisDecision:
-    all_topics = store.list_topics(include_retired=False)
+    """Decide one item. ``topics`` is the store's live topic list, as
+    ``list_topics(include_retired=False, fields=TOPIC_HEAD_FIELDS)`` returns
+    it, for a caller that already holds it: ``synthesize_items`` lists once
+    per batch, since nothing within a batch changes it but the proposals,
+    which travel separately. Without it the list is read here."""
+    if topics is None:
+        topics = store.list_topics(include_retired=False, fields=TOPIC_HEAD_FIELDS)
+    all_topics = list(topics)
 
     # Replay mode (tune.py): the item has already been recorded, so the topic
     # it founded, and its own title among representative observations, would
@@ -1001,7 +1018,7 @@ def synthesize_item(
 
     # Find candidates via vector search (filter retired post-query)
     vector_candidates = [
-        t for t in store.nearest_topics(eval_result.embedding, settings.candidates.vector_limit)
+        t for t in store.nearest_topics(eval_result.embedding, settings.candidates.vector_limit, fields=TOPIC_HEAD_FIELDS)
         if t.get("status") not in ("retired", "deleting") and t["topic_id"] not in hidden_topic_ids
     ]
     if not vector_candidates and all_topics:
@@ -1208,6 +1225,13 @@ def synthesize_items(
     proposed_topics: list[dict] = []
     decisions: list[SynthesisDecision] = []
 
+    # The live topic list is read once for the batch: record runs after
+    # synthesize, so nothing within the batch adds to it but this batch's
+    # own proposals, and those are passed on their own. It is read inside
+    # the per-item try, so a store failure fails that item, as any read
+    # did, and the next item reads again.
+    topics: list[dict] | None = None
+
     for i, (item, eval_result) in enumerate(above_threshold, 1):
         logger.info(
             "Synthesizing item %d/%d: %s",
@@ -1231,9 +1255,11 @@ def synthesize_items(
             ))
             continue
         try:
+            if topics is None:
+                topics = store.list_topics(include_retired=False, fields=TOPIC_HEAD_FIELDS)
             decision = synthesize_item(
                 item, eval_result, store, settings, judge, proposed_topics,
-                decision_model=decision_model,
+                decision_model=decision_model, topics=topics,
             )
         except Exception as e:
             # A failed item is still a decision, with decision="failed", so

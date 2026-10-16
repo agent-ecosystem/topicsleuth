@@ -13,13 +13,14 @@ import pytest
 from topicsleuth.backends.fake import HashEmbedder, ScriptedDecisionModel, ScriptedJudge
 from topicsleuth.backends.memory import MemoryStore
 from topicsleuth.interfaces import Completion
-from topicsleuth.record import record
+from topicsleuth.record import QUIET_TOPIC_FIELDS, record
 from topicsleuth.settings import load_settings
 from topicsleuth.synthesize import (
     cold_start_system_prompt,
     CONFIRM_LINK_STRENGTH,
     GATE_OVERRIDE_DEFAULT_STRENGTH,
     SynthesisDecision,
+    TOPIC_HEAD_FIELDS,
     synthesize_item,
     synthesize_items,
 )
@@ -39,8 +40,8 @@ def _settings(**over):
                                     "candidates": {"vector_limit": 5, "ignored_tags": ["feed"]}, **over})
 
 
-def _store():
-    st = MemoryStore()
+def _store(st=None):
+    st = MemoryStore() if st is None else st
     st.create_topic({"topic_id": "a", "title": "Topic A", "summary": "Tracks A.", "embedding": E_A, "tags": ["alpha"],
                      "snapshots": [{"evidence_count": 3}]})
     st.create_topic({"topic_id": "b", "title": "Topic B", "summary": "Tracks B.", "embedding": E_B, "tags": ["beta"]})
@@ -88,6 +89,64 @@ def test_link_decision_records_observation_and_snapshot():
     assert obs["topic_id"] == "a" and obs["strength"] == 0.80 and obs["tags"] == ["feed", "alpha"] and obs["evidence"] == "ships"
     assert st.get_topic("a")["snapshots"][-1]["evidence_count"] == 4
     assert st.get_item_embeddings(["u1"]) == {"u1": E_A}
+
+
+class _Metered(MemoryStore):
+    """Records each read the hot paths make and the fields it declared."""
+
+    def __init__(self):
+        super().__init__()
+        self.reads: list[tuple[str, tuple | None]] = []
+
+    def list_topics(self, include_retired=True, *, fields=None):
+        self.reads.append(("list_topics", fields))
+        return super().list_topics(include_retired, fields=fields)
+
+    def nearest_topics(self, embedding, limit, *, fields=None):
+        self.reads.append(("nearest_topics", fields))
+        return super().nearest_topics(embedding, limit, fields=fields)
+
+    def get_observations_for_topic(self, topic_id, *, fields=None):
+        self.reads.append(("get_observations_for_topic", fields))
+        return super().get_observations_for_topic(topic_id, fields=fields)
+
+
+def test_hot_paths_declare_their_fields_and_list_topics_once_per_batch():
+    # The reads that pull whole documents are what exhausts a metered
+    # store's transfer allowance (issue #5): every read synthesize and
+    # record make of the topic list, the vector candidates and a topic's
+    # observations says what it will look at, and the topic list, the
+    # largest of them, is read once for the batch, not once per item.
+    st, emb, s = _store(_Metered()), HashEmbedder(DIM), _settings()
+    items, evals = [_item("u1"), _item("u2")], [_Eval("u1", E_A), _Eval("u2", E_A)]
+    decisions = synthesize_items(items, evals, st, s, ScriptedJudge([LINK, LINK]), emb)
+    assert [d.topic_id for d in decisions] == ["a", "a"]
+    assert [f for m, f in st.reads if m == "list_topics"] == [TOPIC_HEAD_FIELDS], "once, for the batch"
+    assert all(f is not None for _, f in st.reads), st.reads
+
+    st.reads.clear()
+    result = record(items, evals, decisions, st, settings=s, embedder=emb)
+    assert len(result.observations_created) == 2 and st.get_topic("a")["embedding_refreshed_count"] == 5, "the threshold refresh ran"
+    assert ("list_topics", QUIET_TOPIC_FIELDS) in st.reads, "the quiet-topic pass"
+    assert all(f is not None for _, f in st.reads), st.reads
+    assert "A evidence 0" in st.get_observations_for_item("a0")[0]["item_title"], "whole documents are still there to read"
+
+
+def test_a_failed_topic_list_fails_that_item_and_the_next_item_reads_again():
+    class _ListFailsOnce(MemoryStore):
+        failed = False
+
+        def list_topics(self, include_retired=True, *, fields=None):
+            if not self.failed:
+                self.failed = True
+                raise RuntimeError("store down")
+            return super().list_topics(include_retired, fields=fields)
+
+    st = _store(_ListFailsOnce())
+    items, evals = [_item("u1"), _item("u2")], [_Eval("u1", E_A), _Eval("u2", E_A)]
+    decisions = synthesize_items(items, evals, st, _settings(), ScriptedJudge([LINK]), HashEmbedder(DIM))
+    assert [d.decision for d in decisions] == ["failed", "link_existing"]
+    assert "store down" in decisions[0].error and decisions[1].topic_id == "a"
 
 
 def test_below_threshold_items_are_not_synthesized():
