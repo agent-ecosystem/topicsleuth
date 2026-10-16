@@ -61,3 +61,8 @@ record:
   # below minor_floor_strength is filed but marked minor.
   minor_floor_after: 20
   minor_floor_strength: 0.7
+  # Item fields copied onto each observation when the item has them, so
+  # a topic's mix over time needs no join back to items. The library acts
+  # on `tags` and always copies it; name here the fields it should only
+  # carry. The copy is a snapshot at record time.
+  carry_fields: [evidence, lanes]

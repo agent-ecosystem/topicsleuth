@@ -564,6 +564,8 @@ judge:
 record:
   minor_floor_after: 20                # from this many observations on a topic...
   minor_floor_strength: 0.7            # ...a new one below this strength is marked minor
+  carry_fields: [evidence, lanes]      # item fields copied onto its observations when present
+                                       # (tags is always copied: the library acts on it)
 ```
 
 Loading history rather than today's documents? Pass `date_from_item=True`
