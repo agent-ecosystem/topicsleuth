@@ -312,6 +312,40 @@ def test_truncated_reviewer_keeps_the_proposal_like_a_garbled_one(caplog):
     assert "Confirmation pass was truncated" in caplog.text
 
 
+def test_first_pass_refused_by_the_judge_is_reported_by_name():
+    # Issue #7: the refusal is deterministic for the prompt, so the error
+    # names it and a feeder can park the item on the first attempt instead
+    # of retrying it until its budget runs out.
+    refused = Completion(text="", input_tokens=11805, output_tokens=0, truncated=False, refused=True)
+    st = _store()
+    d = synthesize_items([_item()], [_Eval("u1", E_A)], st, _settings(), ScriptedJudge([refused]), HashEmbedder(DIM))[0]
+    assert d.decision == "failed"
+    assert d.error == "JudgeRefused: judge refused to answer the first-pass decision; the prompt trips the provider's input classifier"
+    assert "IndexError" not in d.error and "JSONDecodeError" not in d.error
+    assert st.get_observations_for_item("u1") == []
+
+
+def test_refused_reviewer_keeps_the_proposal_like_a_truncated_one(caplog):
+    refused = Completion(text="", truncated=False, refused=True)
+    d = synthesize_items([_item()], [_Eval("u1", E_B)], _store(), _settings(), ScriptedJudge([PROPOSE, refused]), HashEmbedder(DIM))[0]
+    assert d.decision == "propose_new" and d.diagnostics["confirmation"] == "confirmed_new"
+    assert "Confirmation pass was refused" in caplog.text
+
+
+def test_a_store_error_while_checking_for_an_earlier_decision_fails_the_item_not_the_batch(caplog):
+    class _Flaky(MemoryStore):
+        def get_observations_for_item(self, url):
+            if url == "u1":
+                raise ConnectionError("store unreachable")
+            return super().get_observations_for_item(url)
+
+    st = _store(_Flaky())
+    decisions = synthesize_items([_item("u1"), _item("u2")], [_Eval("u1", E_A), _Eval("u2", E_A)], st, _settings(),
+                                 ScriptedJudge([LINK]), HashEmbedder(DIM))
+    assert [d.decision for d in decisions] == ["failed", "link_existing"]
+    assert decisions[0].error == "ConnectionError: store unreachable"
+
+
 def test_record_status_transition_and_embedding_refresh():
     st, emb, s = _store(), HashEmbedder(DIM), _settings()
     for i in range(3):

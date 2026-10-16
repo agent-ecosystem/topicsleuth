@@ -77,23 +77,38 @@ class JudgeTruncated(RuntimeError):
     so a retry with the same cap fails the same way."""
 
 
+class JudgeRefused(RuntimeError):
+    """The judge declined to answer: the provider's safety classifier
+    stopped the call before any text was produced. Raised instead of an
+    index or parse error so the cause is visible. Like truncation it is
+    deterministic for a given prompt, so a feeder should park the item
+    rather than spend its retry budget on it; a transport error, which a
+    retry may fix, never takes this type."""
+
+
 @dataclass
 class Completion:
     """What a judge returned. ``truncated`` is True when the reply was cut
     off at the ``max_tokens`` cap, False when the model finished on its
     own, and None when the backend did not say (fakes may leave it unset).
+    ``refused`` is True when the provider declined to answer and ``text``
+    is empty, False when it answered, None when the backend did not say.
     Each backend maps its own vocabulary for why generation stopped to
-    this one bit; the core never sees a provider's string."""
+    these bits; the core never sees a provider's string."""
 
     text: str
     input_tokens: int | None = None
     output_tokens: int | None = None
     truncated: bool | None = None
+    refused: bool | None = None
 
     def require_complete(self, what: str, setting: str = "max_tokens") -> "Completion":
-        """Return self, or raise ``JudgeTruncated`` if the reply was cut off
-        at the cap. ``what`` names the call and ``setting`` the cap to
-        raise, for the message."""
+        """Return self, or raise ``JudgeRefused`` if the judge declined to
+        answer, or ``JudgeTruncated`` if the reply was cut off at the cap.
+        ``what`` names the call and ``setting`` the cap to raise, for the
+        message."""
+        if self.refused:
+            raise JudgeRefused(f"judge refused to answer the {what}; the prompt trips the provider's input classifier")
         if self.truncated:
             at = f"{self.output_tokens} output tokens" if self.output_tokens is not None else "the output-token cap"
             raise JudgeTruncated(f"judge reply for the {what} was truncated at {at}; raise {setting}")

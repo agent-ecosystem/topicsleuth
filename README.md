@@ -124,7 +124,11 @@ lists it under `already_recorded`. A document that could not be
 finished is listed in `result.failures` with the stage it stopped at.
 Keep it in your queue and hand it over again next run: every stage is
 idempotent, so the retry completes what the failed run left undone (a
-snapshot, a status, an embedding) without repeating what it did. Pass a
+snapshot, a status, an embedding) without repeating what it did. Two
+failures repeat for the same input and are worth parking instead: an
+`error` beginning `JudgeTruncated:` (the judge ran past its output cap;
+raise the cap it names) or `JudgeRefused:` (the provider's classifier
+declined the prompt). Pass a
 `run_id` and everything the run writes is stamped with it, which is what
 lets `clean --run-id` remove one run and nothing else.
 
@@ -551,7 +555,8 @@ synthesize:
   confirm_link_threshold: 0.7          # decision backend: how sure it must be to fold a proposal in
   secondary_link_floor: 0.0            # drop a document's second or later link below this strength
 judge:
-  first_pass_max_tokens: 8192          # output cap per judge call; a reply that hits one fails as JudgeTruncated
+  first_pass_max_tokens: 8192          # output cap per judge call; a reply that hits one fails as JudgeTruncated,
+                                       # one the model declines to give as JudgeRefused: both repeat, so park, do not retry
   confirm_max_tokens: 2048             # (the first pass grows with vector_limit; raise the cap it names)
   merge_max_tokens: 4096
   split_propose_max_tokens: 4096
