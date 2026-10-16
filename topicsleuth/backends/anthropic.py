@@ -22,9 +22,16 @@ class AnthropicJudge:
         )
         usage = getattr(response, "usage", None)
         stop_reason = getattr(response, "stop_reason", None)
+        # A refusal (stop_reason "refusal") comes back with no content
+        # blocks at all, and a reply may carry non-text blocks ahead of its
+        # text, so the text is gathered rather than read from a fixed slot.
+        text = "".join(
+            block.text for block in (response.content or []) if getattr(block, "type", "text") == "text"
+        )
         return Completion(
-            text=response.content[0].text,
+            text=text,
             input_tokens=getattr(usage, "input_tokens", None),
             output_tokens=getattr(usage, "output_tokens", None),
             truncated=None if stop_reason is None else stop_reason == "max_tokens",
+            refused=None if stop_reason is None else stop_reason == "refusal",
         )

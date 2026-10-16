@@ -885,9 +885,12 @@ def _confirm_proposal(
     response = judge.complete(
         confirm_system_prompt(settings), user_content, max_tokens=settings.judge.confirm_max_tokens,
     )
-    # The reviewer is advisory: a reply it could not finish, like one it
-    # garbled, leaves the first-pass proposal standing.
-    if response.truncated:
+    # The reviewer is advisory: a reply it could not finish, or declined to
+    # give, like one it garbled, leaves the first-pass proposal standing.
+    if response.refused:
+        logger.warning("Confirmation pass was refused by the judge; keeping propose_new")
+        confirm = {"verdict": "confirm_new", "reasoning": "(reviewer refused to answer)"}
+    elif response.truncated:
         logger.warning("Confirmation pass was truncated at its output cap; keeping propose_new")
         confirm = {"verdict": "confirm_new", "reasoning": "(truncated reviewer response)"}
     else:
@@ -1239,22 +1242,23 @@ def synthesize_items(
             len(above_threshold),
             item.get("title", "")[:60],
         )
-        # An item the store already holds was decided by an earlier run (a
-        # retry after a late failure, or another feeder). The stored
-        # observation is that decision; the judge is not asked again, so a
-        # retry cannot pick a different topic or open a second one.
-        existing = store.get_observations_for_item(item["url"])
-        if existing:
-            links = intended_links(existing, store)
-            logger.info("  already recorded on %s; not re-judged", [l.topic_id for l in links])
-            decisions.append(SynthesisDecision(
-                item_url=item["url"], item_title=item.get("title", ""), decision="link_existing",
-                topic_id=links[0].topic_id, connection_type=links[0].connection_type, strength=links[0].strength,
-                reasoning_trace=f"ALREADY RECORDED on {[l.topic_id for l in links]} at {existing[0].get('recorded_at')}; the judge was not called.",
-                links=links,
-            ))
-            continue
         try:
+            # An item the store already holds was decided by an earlier run (a
+            # retry after a late failure, or another feeder). The stored
+            # observation is that decision; the judge is not asked again, so a
+            # retry cannot pick a different topic or open a second one. The
+            # check reads the store, so it fails the item, not the batch.
+            existing = store.get_observations_for_item(item["url"])
+            if existing:
+                links = intended_links(existing, store)
+                logger.info("  already recorded on %s; not re-judged", [l.topic_id for l in links])
+                decisions.append(SynthesisDecision(
+                    item_url=item["url"], item_title=item.get("title", ""), decision="link_existing",
+                    topic_id=links[0].topic_id, connection_type=links[0].connection_type, strength=links[0].strength,
+                    reasoning_trace=f"ALREADY RECORDED on {[l.topic_id for l in links]} at {existing[0].get('recorded_at')}; the judge was not called.",
+                    links=links,
+                ))
+                continue
             if topics is None:
                 topics = store.list_topics(include_retired=False, fields=TOPIC_HEAD_FIELDS)
             decision = synthesize_item(

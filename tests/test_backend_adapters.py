@@ -105,7 +105,7 @@ def test_anthropic_judge_maps_request_and_completion():
     j = AnthropicJudge(model="claude-test", client=client)
     assert isinstance(j, Judge)
     out = j.complete("SYSTEM", "USER", max_tokens=77)
-    assert out == Completion(text="{\"decision\": \"skip\"}", input_tokens=123, output_tokens=45, truncated=False)
+    assert out == Completion(text="{\"decision\": \"skip\"}", input_tokens=123, output_tokens=45, truncated=False, refused=False)
     call = client.calls[0]
     assert call["model"] == "claude-test" and call["max_tokens"] == 77 and call["system"] == "SYSTEM"
     assert call["messages"] == [{"role": "user", "content": "USER"}]
@@ -128,6 +128,52 @@ def test_anthropic_judge_reports_a_reply_cut_off_at_max_tokens():
         out.require_complete("first-pass decision")
     assert Completion(text="{}").truncated is None, "a backend that does not say leaves it unknown"
     assert Completion(text="{}").require_complete("anything") is not None, "unknown is not a claim of truncation"
+
+
+def test_anthropic_judge_reports_a_refusal_instead_of_indexing_an_empty_reply():
+    # Issue #7: a refusal comes back with stop_reason "refusal" and no
+    # content blocks, and the backend crashed reading content[0].
+    pytest.importorskip("anthropic")
+    from topicsleuth.backends.anthropic import AnthropicJudge
+    from topicsleuth.interfaces import JudgeRefused
+
+    class _RefusedMessages(_Messages):
+        def create(self, **kwargs):
+            m = _Message("", stop_reason="refusal")
+            m.content = []
+            return m
+
+    client = _AnthropicClient()
+    client.messages = _RefusedMessages(client)
+    out = AnthropicJudge(model="claude-test", client=client).complete("SYSTEM", "USER")
+    assert out == Completion(text="", input_tokens=123, output_tokens=45, truncated=False, refused=True)
+    with pytest.raises(JudgeRefused, match="judge refused to answer the first-pass decision"):
+        out.require_complete("first-pass decision")
+    assert Completion(text="{}").refused is None, "a backend that does not say leaves it unknown"
+    assert Completion(text="{}", refused=False).require_complete("anything") is not None
+
+
+def test_anthropic_judge_gathers_text_across_blocks():
+    pytest.importorskip("anthropic")
+    from topicsleuth.backends.anthropic import AnthropicJudge
+
+    class _Thinking:
+        type = "thinking"
+        thinking = "hmm"
+
+    class _Text(_Block):
+        type = "text"
+
+    class _MixedMessages(_Messages):
+        def create(self, **kwargs):
+            m = _Message("")
+            m.content = [_Thinking(), _Text('{"decision": '), _Text('"skip"}')]
+            return m
+
+    client = _AnthropicClient()
+    client.messages = _MixedMessages(client)
+    out = AnthropicJudge(model="claude-test", client=client).complete("SYSTEM", "USER")
+    assert out.text == '{"decision": "skip"}', "a non-text block ahead of the text is not mistaken for the reply"
 
 
 # ── Jev ──
