@@ -747,14 +747,18 @@ def _record_link(store, result, decision, link, item, obs_date, now, backfill, r
         "reasoning_trace": decision.reasoning_trace,
         "source_name": item.get("source_name", "") if item else "",
         "source_type": item.get("source_type", "") if item else "",
-        # Copied from the item so a topic's lane mix and evidence mix
-        # over time are computable without joining back to items.
         "tags": list(item.get("tags") or []) if item else [],
-        "evidence": item.get("evidence") if item else None,
-        "lanes": item.get("lanes") if item else None,
         "entities_mentioned": [],
         "minor": is_minor,
     }
+    # Copied from the item, as it is now, so a topic's mix over time is
+    # computable without joining back to items. The library acts on tags
+    # (candidate overlap, the judge's prompt); the rest are whatever the
+    # feeder declared in settings.record.carry_fields, and keeping them
+    # current after the item changes is the feeder's job.
+    for name in settings.record.carry_fields:
+        if item and name in item:
+            obs_doc[name] = item[name]
     if backfill:
         obs_doc["backfill"] = True
     if run_id:

@@ -103,6 +103,15 @@ class JudgeConfig:
     split_reassign_max_tokens: int = 8192
 
 
+# Observation fields record writes itself. A carry field may not shadow one.
+OBSERVATION_FIELDS = frozenset({
+    "_id", "item_id", "item_url", "item_title", "topic_id", "date", "strength",
+    "connection_type", "fit_questions", "decision_links", "reasoning_trace",
+    "source_name", "source_type", "tags", "entities_mentioned", "minor",
+    "backfill", "run_id", "recorded_at", "relocated_at", "moved_from", "removed_from",
+})
+
+
 @dataclass
 class RecordConfig:
     """Write-stage controls.
@@ -111,9 +120,26 @@ class RecordConfig:
         observation whose strength is below minor_floor_strength is still
         filed but marked ``minor``, so a well-evidenced topic does not
         drift on tangential links.
+    carry_fields: item fields copied verbatim onto each observation the
+        item produces, when the item has them, so a topic's mix over time
+        is computable without joining back to items. ``tags`` is not
+        listed because the library acts on it and always copies it. The
+        copy is a snapshot at record time; refreshing it after the item
+        changes is the feeder's job.
     """
     minor_floor_after: int = 20
     minor_floor_strength: float = 0.7
+    carry_fields: list[str] = field(default_factory=lambda: ["evidence", "lanes"])
+
+    def __post_init__(self):
+        if not isinstance(self.carry_fields, list) or not all(isinstance(f, str) for f in self.carry_fields):
+            raise ValueError("record.carry_fields must be a list of field names")
+        reserved = set(self.carry_fields) & OBSERVATION_FIELDS
+        if reserved:
+            raise ValueError(
+                f"record.carry_fields cannot name fields the library writes itself: {sorted(reserved)}"
+            )
+
 
 
 @dataclass

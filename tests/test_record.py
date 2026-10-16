@@ -1,6 +1,7 @@
 """Hermetic tests for the record-stage helpers."""
 from __future__ import annotations
 
+import pytest
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -150,12 +151,39 @@ class TestRecordPassThrough:
         assert obs["evidence"] == "ships"
         assert obs["lanes"] == {"lane-a": 0.9}
 
-    def test_absent_fields_are_empty_not_missing(self):
+    def test_absent_carry_fields_are_left_off(self):
         from topicsleuth.record import record
         st = _FakeStorage()
         record(*_one_link(), st, settings=Settings())
         obs = _obs(st)[0]
-        assert obs["tags"] == [] and obs["evidence"] is None and obs["lanes"] is None
+        assert obs["tags"] == []
+        assert "evidence" not in obs and "lanes" not in obs
+
+    def test_feeder_declares_which_fields_to_carry(self):
+        from topicsleuth.record import record
+        from topicsleuth.settings import load_settings
+        st = _FakeStorage()
+        settings = load_settings(overrides={"record": {"carry_fields": ["evidence", "lanes", "vendors"]}})
+        record(*_dated_link(evidence="ships", vendors=["acme"], body="not carried"), st, settings=settings)
+        obs = _obs(st)[0]
+        assert obs["evidence"] == "ships" and obs["vendors"] == ["acme"]
+        assert "lanes" not in obs and "body" not in obs
+
+    def test_tags_are_carried_whether_declared_or_not(self):
+        from topicsleuth.record import record
+        from topicsleuth.settings import load_settings
+        st = _FakeStorage()
+        settings = load_settings(overrides={"record": {"carry_fields": []}})
+        record(*_dated_link(tags=["lane-a"], evidence="ships"), st, settings=settings)
+        obs = _obs(st)[0]
+        assert obs["tags"] == ["lane-a"] and "evidence" not in obs
+
+    def test_a_carry_field_cannot_shadow_what_record_writes(self):
+        from topicsleuth.settings import load_settings
+        with pytest.raises(ValueError, match="carry_fields cannot name fields the library writes itself: \\['tags', 'topic_id'\\]"):
+            load_settings(overrides={"record": {"carry_fields": ["vendors", "topic_id", "tags"]}})
+        with pytest.raises(ValueError, match="carry_fields must be a list of field names"):
+            load_settings(overrides={"record": {"carry_fields": "vendors"}})
 
 
 def _topic_with_evidence(st, topic_id, status, dates, title=None):
