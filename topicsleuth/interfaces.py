@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, Sequence, runtime_checkable
 
 
 # How long a maintenance operation's deletion mark on a topic is honoured
@@ -181,12 +181,24 @@ class Store(Protocol):
     with respect to every other caller of the store, whichever threads or
     processes they run in. ``topicsleuth.backends.memory`` is the
     reference: one lock around every operation.
+
+    Three reads take ``fields``: ``list_topics``, ``nearest_topics`` and
+    ``get_observations_for_topic``. Given field names, a store returns each
+    document with exactly those fields and its identity (``topic_id`` for a
+    topic, ``_id`` for an observation; ``nearest_topics`` keeps its
+    ``vector_score`` too). A field the document lacks is absent, not None.
+    Without ``fields``, whole documents. It is how a caller on a hot path
+    says what it reads, so a store that pays per byte transfers no
+    embeddings or reasoning traces nobody will look at; a store with no
+    native projection filters what it fetched. ``topicsleuth.backends.memory``
+    is the reference here too: it returns exactly what was asked for, so a
+    caller that reads a field it did not declare fails in the test suite.
     """
 
     # ── topics ──
     def get_topic(self, topic_id: str) -> dict | None: ...
 
-    def list_topics(self, include_retired: bool = True) -> list[dict]: ...
+    def list_topics(self, include_retired: bool = True, *, fields: Sequence[str] | None = None) -> list[dict]: ...
 
     def create_topic(self, topic_doc: dict) -> str: ...
 
@@ -248,7 +260,7 @@ class Store(Protocol):
 
     def append_snapshot(self, topic_id: str, snapshot: dict) -> None: ...
 
-    def nearest_topics(self, embedding: list[float], limit: int) -> list[dict]:
+    def nearest_topics(self, embedding: list[float], limit: int, *, fields: Sequence[str] | None = None) -> list[dict]:
         """Topics nearest to the embedding, each with a ``vector_score``
         (cosine similarity, higher is closer). May include retired topics;
         callers filter."""
@@ -261,7 +273,7 @@ class Store(Protocol):
     # ── observations ──
     def create_observation(self, obs_doc: dict) -> Any: ...
 
-    def get_observations_for_topic(self, topic_id: str) -> list[dict]: ...
+    def get_observations_for_topic(self, topic_id: str, *, fields: Sequence[str] | None = None) -> list[dict]: ...
 
     def count_observations_for_topic(self, topic_id: str) -> int: ...
 

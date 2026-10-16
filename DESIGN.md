@@ -48,7 +48,8 @@ has never heard of; nothing here is at that stage.
 
 Why `MemoryStore` is a real implementation and not a test double: it is the
 reference semantics for the protocol, exact cosine where a vector index
-approximates, and it lets the suite run record and synthesize end to end
+approximates, exactly the fields a narrowed read declares where a database
+would project, and it lets the suite run record and synthesize end to end
 without a database. A store contract test runs the same assertions against
 every implementation. The fakes for the other seams (`backends.fake`) are
 shipped for the same reason: a consumer's tests should not need a model.

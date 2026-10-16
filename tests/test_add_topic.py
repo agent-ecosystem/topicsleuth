@@ -90,8 +90,11 @@ class _MoveStorage:
     def count_observations_for_topic(self, tid):
         return sum(1 for o in self._obs if o["topic_id"] == tid)
 
-    def get_observations_for_topic(self, tid):
-        return [o for o in self._obs if o["topic_id"] == tid]
+    def get_observations_for_topic(self, tid, *, fields=None):
+        rows = [o for o in self._obs if o["topic_id"] == tid]
+        if fields is None:
+            return rows
+        return [{k: v for k, v in o.items() if k in {*fields, "_id"}} for o in rows]
 
     def get_topic(self, tid):
         return self._topics.get(tid)

@@ -16,7 +16,7 @@ import itertools
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -36,6 +36,16 @@ def _aware(value):
     if isinstance(value, list):
         return [_aware(v) for v in value]
     return value
+
+
+def _pick(doc: dict, fields: Sequence[str] | None, identity: str) -> dict:
+    """A copy of the document with exactly ``fields`` and its identity,
+    the Store contract for a narrowed read; the whole document without
+    ``fields``."""
+    if fields is None:
+        return copy.deepcopy(doc)
+    keep = {*fields, identity}
+    return copy.deepcopy({k: v for k, v in doc.items() if k in keep})
 
 
 def _atomic(method):
@@ -63,8 +73,8 @@ class MemoryStore:
         return copy.deepcopy(t) if t else None
 
     @_atomic
-    def list_topics(self, include_retired: bool = True) -> list[dict]:
-        return [copy.deepcopy(t) for t in self.topics.values()
+    def list_topics(self, include_retired: bool = True, *, fields: Sequence[str] | None = None) -> list[dict]:
+        return [_pick(t, fields, "topic_id") for t in self.topics.values()
                 if include_retired or t.get("status") not in LIVE_STATUSES_EXCLUDED]
 
     @_atomic
@@ -165,7 +175,7 @@ class MemoryStore:
         t["last_updated"] = datetime.now(timezone.utc)
 
     @_atomic
-    def nearest_topics(self, embedding: list[float], limit: int) -> list[dict]:
+    def nearest_topics(self, embedding: list[float], limit: int, *, fields: Sequence[str] | None = None) -> list[dict]:
         q = np.asarray(embedding, dtype=np.float32)
         qn = float(np.linalg.norm(q)) or 1.0
         scored = []
@@ -179,7 +189,7 @@ class MemoryStore:
         scored.sort(key=lambda s: -s[0])
         out = []
         for score, t in scored[:limit]:
-            d = copy.deepcopy(t)
+            d = _pick(t, fields, "topic_id")
             d["vector_score"] = score
             out.append(d)
         return out
@@ -229,8 +239,8 @@ class MemoryStore:
         return oid
 
     @_atomic
-    def get_observations_for_topic(self, topic_id: str) -> list[dict]:
-        return [copy.deepcopy(o) for o in self.observations.values() if o.get("topic_id") == topic_id]
+    def get_observations_for_topic(self, topic_id: str, *, fields: Sequence[str] | None = None) -> list[dict]:
+        return [_pick(o, fields, "_id") for o in self.observations.values() if o.get("topic_id") == topic_id]
 
     @_atomic
     def count_observations_for_topic(self, topic_id: str) -> int:

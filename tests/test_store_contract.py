@@ -100,6 +100,23 @@ def test_nearest_topics_scores_by_cosine(store):
     assert out[0]["vector_score"] >= out[1]["vector_score"]
 
 
+def test_fields_narrow_a_read_to_what_was_asked_for(store):
+    _seed(store)
+    store.create_observation({"topic_id": "a", "item_url": "u1", "item_title": "One", "strength": 0.9, "reasoning_trace": "long"})
+    _settle(store)
+    heads = {t["topic_id"]: t for t in store.list_topics(include_retired=False, fields=("title", "tags"))}
+    assert heads["a"] == {"topic_id": "a", "title": "A", "tags": ["x"]}, "exactly the fields plus the identity"
+    assert heads["b"] == {"topic_id": "b", "title": "B"}, "a field the document lacks is absent"
+    near = store.nearest_topics([1.0, 0.0, 0.0, 0.0], limit=1, fields=("title",))
+    assert near[0]["topic_id"] == "a" and near[0]["title"] == "A"
+    assert set(near[0]) == {"topic_id", "title", "vector_score"}, "the score stays, the embedding does not"
+    obs = store.get_observations_for_topic("a", fields=("item_title", "strength"))
+    assert len(obs) == 1 and set(obs[0]) == {"_id", "item_title", "strength"}
+    assert obs[0]["item_title"] == "One" and obs[0]["strength"] == 0.9
+    assert store.get_observations_for_topic("a")[0]["reasoning_trace"] == "long", "without fields, the whole document"
+    assert "embedding" in store.list_topics()[0]
+
+
 def test_observations(store):
     _seed(store)
     oid = store.create_observation({"topic_id": "a", "item_url": "u1", "item_title": "One"})

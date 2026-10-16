@@ -22,13 +22,24 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Sequence
 
 from topicsleuth.history import fold_fields
 from topicsleuth.interfaces import DELETING_LEASE_SECONDS, DestinationNotLive, DuplicateObservation, DuplicateTopic, StoreError
 
 DEFAULT_COLLECTIONS = {"topics": "topics", "observations": "observations", "items": "items"}
 LIVE = {"$nin": ["retired", "deleting"]}
+
+
+def _projection(fields: Sequence[str] | None, identity: str) -> dict | None:
+    """The Store contract's ``fields`` as a pymongo projection: exactly
+    those fields plus the identity, so ``_id`` comes back only when it is
+    the identity (an observation's) or was asked for."""
+    if fields is None:
+        return None
+    projection = {f: 1 for f in (*fields, identity)}
+    projection.setdefault("_id", 0)
+    return projection
 
 
 class MongoStore:
@@ -79,9 +90,9 @@ class MongoStore:
     def get_topic(self, topic_id: str) -> dict | None:
         return self.topics.find_one({"topic_id": topic_id})
 
-    def list_topics(self, include_retired: bool = True) -> list[dict]:
+    def list_topics(self, include_retired: bool = True, *, fields: Sequence[str] | None = None) -> list[dict]:
         q = {} if include_retired else {"status": LIVE}
-        return list(self.topics.find(q))
+        return list(self.topics.find(q, _projection(fields, "topic_id")))
 
     def _transaction(self, body):
         """Run ``body(session)`` as one transaction and return its result.
@@ -183,7 +194,7 @@ class MongoStore:
              "$set": {"last_updated": datetime.now(timezone.utc)}},
         )
 
-    def nearest_topics(self, embedding: list[float], limit: int) -> list[dict]:
+    def nearest_topics(self, embedding: list[float], limit: int, *, fields: Sequence[str] | None = None) -> list[dict]:
         from pymongo.errors import OperationFailure
         pipeline = [
             {"$vectorSearch": {
@@ -195,6 +206,8 @@ class MongoStore:
             }},
             {"$addFields": {"vector_score": {"$meta": "vectorSearchScore"}}},
         ]
+        if fields is not None:
+            pipeline.append({"$project": {**_projection(fields, "topic_id"), "vector_score": 1}})
         try:
             return list(self.topics.aggregate(pipeline))
         except OperationFailure as e:
@@ -226,8 +239,8 @@ class MongoStore:
                 f"observation exists for {obs_doc.get('item_url')} on {obs_doc.get('topic_id')}"
             ) from e
 
-    def get_observations_for_topic(self, topic_id: str) -> list[dict]:
-        return list(self.observations.find({"topic_id": topic_id}))
+    def get_observations_for_topic(self, topic_id: str, *, fields: Sequence[str] | None = None) -> list[dict]:
+        return list(self.observations.find({"topic_id": topic_id}, _projection(fields, "_id")))
 
     def count_observations_for_topic(self, topic_id: str) -> int:
         return self.observations.count_documents({"topic_id": topic_id})

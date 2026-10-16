@@ -107,13 +107,19 @@ def refresh_topic_embedding(
     raise RefreshConflict(f"topic {topic_id!r}: an embedding was published ahead of this refresh {REFRESH_ATTEMPTS} times")
 
 
+# What a refresh reads of a topic's observations, declared to the store
+# (the ``fields`` of ``Store.get_observations_for_topic``): which items
+# count and which are minor.
+REFRESH_FIELDS = ("item_url", "minor")
+
+
 def _compute_refresh(topic, store, settings, embedder):
     """The blended embedding, the sorted item urls it was computed from,
     the urls it wanted (every non-minor observation's item) and the
     topic's observation count, or None if there is nothing to compute it
     from."""
     topic_id = topic["topic_id"]
-    observations = store.get_observations_for_topic(topic_id)
+    observations = store.get_observations_for_topic(topic_id, fields=REFRESH_FIELDS)
     non_minor = [o for o in observations if not o.get("minor")]
     if not non_minor:
         logger.debug(
