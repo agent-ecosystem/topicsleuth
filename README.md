@@ -173,7 +173,9 @@ its life. Every topic carries a status that moves as evidence arrives or
 stops arriving:
 
 - **emerging**: a new page with fewer than five observations. It may be
-  the start of something, or a one-off.
+  the start of something, or a one-off: one whose last evidence is more
+  than thirty days old goes dormant directly, since it never had a pace
+  to fade from.
 - **active**: five or more observations. The question has drawn repeated
   evidence.
 - **mature**: twenty or more observations, a well-established thread. From
@@ -182,8 +184,9 @@ stops arriving:
   are settings, under `record`.
 - **fading**: an active or mature topic that has gone a week with no new
   evidence. Fresh evidence sends it back to active.
-- **dormant**: a fading topic whose last evidence is more than thirty days
-  old. Fresh evidence sends it back to emerging, to earn its place again.
+- **dormant**: a fading or emerging topic whose last evidence is more than
+  thirty days old. Fresh evidence sends it back to emerging, to earn its
+  place again.
 
 Topics you merge or split are marked **retired** and keep a pointer to
 what replaced them, so old links still resolve.

@@ -269,15 +269,49 @@ class TestQuietTopicsFadeAndGoDormant:
         assert st.topics["f"]["status"] == "active"
         assert st.topics["d"]["status"] == "emerging"
 
-    def test_emerging_and_retired_topics_never_fade(self):
+    def test_emerging_topic_goes_dormant_after_thirty_days_without_fading(self):
+        """A seed with one to four observations has no pace to lose, so it
+        skips fading; until thirty days pass it is left alone, snapshot
+        and all."""
         from topicsleuth.backends.memory import MemoryStore
         from topicsleuth.record import record
         st = MemoryStore()
-        _topic_with_evidence(st, "single", "emerging", [_days_ago(90)])
+        _topic_with_evidence(st, "recent", "emerging", [_days_ago(20)])
+        _topic_with_evidence(st, "seed", "emerging", [_days_ago(90)])
+        _topic_with_evidence(st, "pair", "emerging", [_days_ago(31), _days_ago(45)])
+        result = record([], [], [], st, settings=Settings())
+        assert st.topics["recent"]["status"] == "emerging"
+        assert st.topics["recent"]["snapshots"] == []
+        assert st.topics["seed"]["status"] == "dormant"
+        assert st.topics["pair"]["status"] == "dormant"
+        assert [(t["topic_id"], t["from_status"], t["to_status"]) for t in result.transitions] == [
+            ("seed", "emerging", "dormant"), ("pair", "emerging", "dormant"),
+        ]
+        snap = st.topics["seed"]["snapshots"][-1]
+        assert snap["velocity"] == 0.0 and snap["evidence_count"] == 1
+
+    def test_dormant_seed_revives_as_emerging_and_can_go_dormant_again(self):
+        from topicsleuth.backends.memory import MemoryStore
+        from topicsleuth.record import record
+        st = MemoryStore()
+        _topic_with_evidence(st, "seed", "emerging", [_days_ago(90)])
+        record([], [], [], st, settings=Settings())
+        assert st.topics["seed"]["status"] == "dormant"
+        record(*_link_to("seed", "x1"), st, settings=Settings())
+        assert st.topics["seed"]["status"] == "emerging"
+        result = record([], [], [], st, settings=Settings())
+        assert result.transitions == [] and st.topics["seed"]["status"] == "emerging"
+
+    def test_emerging_topic_without_observations_and_retired_topics_are_left_alone(self):
+        from topicsleuth.backends.memory import MemoryStore
+        from topicsleuth.record import record
+        st = MemoryStore()
+        st.create_topic({"topic_id": "empty", "title": "Empty", "status": "emerging",
+                         "date_identified": _days_ago(90)})
         _topic_with_evidence(st, "old", "retired", [_days_ago(90)])
         result = record([], [], [], st, settings=Settings())
         assert result.transitions == []
-        assert st.topics["single"]["status"] == "emerging"
+        assert st.topics["empty"]["status"] == "emerging"
         assert st.topics["old"]["status"] == "retired"
 
     def test_touched_topic_is_not_checked_twice(self):
