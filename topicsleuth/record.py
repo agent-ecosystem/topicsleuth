@@ -148,8 +148,14 @@ def _detect_transition(
     new_status = current_status
 
     if current_status == "emerging":
+        days_since = snapshot.get("days_since_evidence")
         if evidence_count >= STATUS_THRESHOLDS["emerging_to_active"]:
             new_status = "active"
+        elif days_since is not None and days_since >= STATUS_THRESHOLDS["dormant_days"]:
+            # A seed that never drew a second look. It goes dormant
+            # directly: fading is a drop from a pace it never had, and
+            # without this exit its first snapshot would stand forever.
+            new_status = "dormant"
     elif current_status == "active":
         if evidence_count >= STATUS_THRESHOLDS["active_to_mature"]:
             new_status = "mature"
@@ -516,8 +522,8 @@ def record(
             _refresh_or_defer(store, topic_id, settings, embedder, urls_here, fail, embed_failed)
 
     # 5. Status check on the quiet topics. A topic that received nothing
-    #    this run can only fade or go dormant, and nothing else would ever
-    #    look at it. The check is as of this run's "now", or, when loading
+    #    this run can only fade or go dormant (an emerging one goes dormant
+    #    straight away), and nothing else would ever look at it. The check is as of this run's "now", or, when loading
     #    history, the latest date in the batch, so history reads as history.
     #    A snapshot is written only when the status changes, so a long quiet
     #    spell does not pile up identical snapshots.
