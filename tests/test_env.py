@@ -49,3 +49,16 @@ def test_collection_names_from_the_environment_reach_the_store(from_uri, monkeyp
     # Only the names that are set are passed; the items collection keeps its default.
     assert kwargs["collections"] == {"topics": "briefing_topics", "observations": "briefing_observations"}
     assert kwargs["vector_index"] == "briefing_topic_embedding_index"
+
+
+def test_judge_effort_comes_from_the_environment(monkeypatch):
+    pytest.importorskip("anthropic")
+    from topicsleuth.env import judge_from_env
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.delenv("TOPICSLEUTH_JUDGE", raising=False)
+    monkeypatch.delenv("TOPICSLEUTH_JUDGE_EFFORT", raising=False)
+    assert judge_from_env().effort is None, "unset means the model's default"
+    monkeypatch.setenv("TOPICSLEUTH_JUDGE_MODEL", "claude-x")
+    monkeypatch.setenv("TOPICSLEUTH_JUDGE_EFFORT", "medium")
+    j = judge_from_env()
+    assert (j.model, j.effort) == ("claude-x", "medium")

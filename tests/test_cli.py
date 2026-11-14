@@ -184,10 +184,12 @@ def test_tune_replays_a_prior_report(capsys, env):
                                 "links": [{"topic_id": "a", "connection_type": "supports",
                                            "fit_questions": {"q1_scope_expansion": True, "q2_representative_citation": True, "q3_distinguishing_evidence": True}}],
                                 "reasoning_trace": "r"})
-    code, out = run(capsys, "tune", "synthesize", "--replay", "prior.json", "--label", "t", "--limit", "3", "--model", "m2")
-    assert code == 0 and "link_existing     1" in out and "report:" in out
+    code, out = run(capsys, "tune", "synthesize", "--replay", "prior.json", "--label", "t", "--limit", "3", "--model", "m2",
+                    "--effort", "low")
+    assert code == 0 and "link_existing     1" in out and "report:" in out and "effort=low" in out
     report = json.loads((env / "tuning_runs" / "synthesize-t-replay.json").read_text())
     assert report["config"]["model"] == "m2" and report["config"]["candidates"]["vector_limit"] == 3 and "leave_one_out" not in report
+    assert report["config"]["effort"] == "low", "the level a replay ran at is in its report, next to the model"
     code, out = run(capsys, "tune", "synthesize")
     assert code != 0 and "needs --replay" in str(code)
 

@@ -107,8 +107,51 @@ def test_anthropic_judge_maps_request_and_completion():
     out = j.complete("SYSTEM", "USER", max_tokens=77)
     assert out == Completion(text="{\"decision\": \"skip\"}", input_tokens=123, output_tokens=45, truncated=False, refused=False)
     call = client.calls[0]
-    assert call["model"] == "claude-test" and call["max_tokens"] == 77 and call["system"] == "SYSTEM"
+    assert call["model"] == "claude-test" and call["max_tokens"] == 77
+    assert call["system"] == [{"type": "text", "text": "SYSTEM", "cache_control": {"type": "ephemeral"}}], \
+        "the rubric is the same several thousand tokens on every call of a run, so it is cached by default"
     assert call["messages"] == [{"role": "user", "content": "USER"}]
+    assert "output_config" not in call, "no effort set: the model's default, not a guess"
+
+
+def test_anthropic_judge_sends_effort_and_can_leave_the_system_prompt_plain():
+    pytest.importorskip("anthropic")
+    from topicsleuth.backends.anthropic import AnthropicJudge
+
+    client = _AnthropicClient()
+    j = AnthropicJudge(model="claude-test", client=client, effort="low", cache_system=False)
+    assert j.effort == "low"
+    j.complete("SYSTEM", "USER")
+    call = client.calls[0]
+    assert call["output_config"] == {"effort": "low"}
+    assert call["system"] == "SYSTEM"
+    j.effort = None  # a replay flag clears it between runs
+    j.complete("SYSTEM", "USER")
+    assert "output_config" not in client.calls[1]
+
+
+def test_anthropic_judge_reports_cache_reads_apart_from_billed_input():
+    pytest.importorskip("anthropic")
+    from topicsleuth.backends.anthropic import AnthropicJudge
+
+    class _CachedUsage(_Usage):
+        input_tokens = 9000
+        cache_read_input_tokens = 2800
+        cache_creation_input_tokens = 0
+
+    class _CachedMessages(_Messages):
+        def create(self, **kwargs):
+            self.outer.calls.append(kwargs)
+            m = _Message('{"decision": "skip"}')
+            m.usage = _CachedUsage()
+            return m
+
+    client = _AnthropicClient()
+    client.messages = _CachedMessages(client)
+    out = AnthropicJudge(model="claude-test", client=client).complete("SYSTEM", "USER")
+    assert (out.input_tokens, out.cache_read_input_tokens, out.cache_creation_input_tokens) == (9000, 2800, 0), \
+        "a caller pricing the run adds the three at their own rates; the cached part is not folded into input"
+    assert Completion(text="{}").cache_read_input_tokens is None, "a backend that does not cache leaves it unset"
 
 
 def test_anthropic_judge_reports_a_reply_cut_off_at_max_tokens():

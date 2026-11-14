@@ -93,7 +93,7 @@ from topicsleuth.synthesize import synthesize_items
 settings = load_settings("settings.yaml")
 store = MongoStore.from_uri(MONGODB_URI, database="briefing")
 embedder = VoyageEmbedder(model="voyage-4", dimensions=settings.embedding.dimensions)
-judge = AnthropicJudge(model="claude-opus-4-8")
+judge = AnthropicJudge(model="claude-opus-4-8")   # effort="low" to set the reasoning effort; the rubric is prompt-cached
 
 items = fetch_new_documents()        # your dicts: url, title, summary, source_type, tags ...
 
@@ -334,6 +334,14 @@ so you can try a value before you keep it.
   swaps it for one replay. Expect the boundary to move: a different model
   draws the line between "link" and "new topic" somewhere else, which is
   why a model change gets the full two-seed treatment.
+- **The effort.** `AnthropicJudge(effort="low")`, `TOPICSLEUTH_JUDGE_EFFORT`
+  for the CLI, `--effort` for one replay. On a model whose thinking cannot
+  be turned off, effort is the only control over how much the judge thinks,
+  and thinking bills as output tokens, so the report's mean output tokens
+  per call is the number to read beside the decisions. The judge caches
+  the rubric (its system prompt) across calls; the report shows cache
+  reads apart from billed input so a run can be priced at the provider's
+  cached rate.
 - **Which topics the judge sees.** `candidates.vector_limit` is how many
   nearest topics go in the prompt, `candidates.tag_overlap` adds every
   topic sharing a tag with the document, and `candidates.ignored_tags`
