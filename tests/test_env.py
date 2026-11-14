@@ -62,3 +62,23 @@ def test_judge_effort_comes_from_the_environment(monkeypatch):
     monkeypatch.setenv("TOPICSLEUTH_JUDGE_EFFORT", "medium")
     j = judge_from_env()
     assert (j.model, j.effort) == ("claude-x", "medium")
+
+
+def test_the_store_settings_name_the_judge_and_the_environment_overrides_for_one_run(monkeypatch, tmp_path):
+    pytest.importorskip("anthropic")
+    from topicsleuth.env import judge_from_env
+    from topicsleuth.settings import load_settings
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    for v in ("TOPICSLEUTH_JUDGE", "TOPICSLEUTH_JUDGE_MODEL", "TOPICSLEUTH_JUDGE_EFFORT"):
+        monkeypatch.delenv(v, raising=False)
+    f = tmp_path / "store.yaml"
+    f.write_text("domain: a field\njudge:\n  model: claude-sonnet-5-5\n  effort: low\n")
+    s = load_settings(f)
+    assert (s.judge.model, s.judge.effort) == ("claude-sonnet-5-5", "low") and s.judge.first_pass_max_tokens == 8192
+    j = judge_from_env(s)
+    assert (j.model, j.effort) == ("claude-sonnet-5-5", "low"), "the CLI judges with the model the feeder judges with"
+    monkeypatch.setenv("TOPICSLEUTH_JUDGE_MODEL", "claude-opus-4-8")
+    assert judge_from_env(s).model == "claude-opus-4-8" and judge_from_env(s).effort == "low", "the environment overrides one field at a time"
+    monkeypatch.delenv("TOPICSLEUTH_JUDGE_MODEL")
+    (tmp_path / "none.yaml").write_text("domain: x\n")
+    assert judge_from_env(load_settings(tmp_path / "none.yaml")).model == "claude-opus-4-8", "nothing named: the library default"
