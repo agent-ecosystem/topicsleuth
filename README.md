@@ -334,8 +334,14 @@ so you can try a value before you keep it.
   swaps it for one replay. Expect the boundary to move: a different model
   draws the line between "link" and "new topic" somewhere else, which is
   why a model change gets the full two-seed treatment.
-- **The effort.** `AnthropicJudge(effort="low")`, `TOPICSLEUTH_JUDGE_EFFORT`
-  for the CLI, `--effort` for one replay. On a model whose thinking cannot
+- **Where the model is named.** `judge.model` and `judge.effort` in the
+  settings file are what the feeder runs and what the CLI runs (merge,
+  split, reprocess, tune), so curation by hand judges with the same model
+  as the daily. `TOPICSLEUTH_JUDGE_MODEL` and `TOPICSLEUTH_JUDGE_EFFORT`
+  override them for one shell; `--model` and `--effort` for one replay.
+  Unset everywhere, the library's default model runs.
+- **The effort.** `judge.effort` in the settings file, `TOPICSLEUTH_JUDGE_EFFORT`
+  for one shell, `--effort` for one replay. On a model whose thinking cannot
   be turned off, effort is the only control over how much the judge thinks,
   and thinking bills as output tokens, so the report's mean output tokens
   per call is the number to read beside the decisions. The judge caches

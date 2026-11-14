@@ -82,11 +82,21 @@ class SynthesizeConfig:
 
 @dataclass
 class JudgeConfig:
-    """Output-token caps, one per call the library makes to the Judge. A
-    cap costs nothing until a reply reaches it, and a reply that does is
-    cut off and refused (``JudgeTruncated``), so the defaults are generous.
-    Raise one when a call reports truncation. Unlike the other sections,
-    two feeders need not agree on these: they shape no decision.
+    """Which model judges, at what effort, and the output-token caps per
+    call the library makes to it.
+
+    model, effort: the judge every writer to this store runs, and the one
+        the CLI's curation commands (merge, split, reprocess, tune) run
+        when ``TOPICSLEUTH_JUDGE_MODEL`` / ``TOPICSLEUTH_JUDGE_EFFORT`` are
+        not set. These shape every decision, so they live here, in the
+        file the feeder and the CLI both read, rather than in a feeder's
+        own settings where the CLI cannot see them. None means the
+        library's default model and the model's default effort.
+
+    The caps cost nothing until a reply reaches one, and a reply that does
+    is cut off and refused (``JudgeTruncated``), so the defaults are
+    generous. Raise one when a call reports truncation. Two feeders need
+    not agree on the caps: they shape no decision.
 
     first_pass_max_tokens: the link-or-propose decision. The reply
         classifies every shown candidate, each with its own question, so it
@@ -96,6 +106,8 @@ class JudgeConfig:
     split_propose_max_tokens: the proposed sub-topics.
     split_reassign_max_tokens: one batch of observation reassignments.
     """
+    model: str | None = None
+    effort: str | None = None
     first_pass_max_tokens: int = 8192
     confirm_max_tokens: int = 2048
     merge_max_tokens: int = 4096

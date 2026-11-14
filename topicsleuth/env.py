@@ -74,13 +74,21 @@ def embedder_from_env(settings: Settings) -> Embedder:
     )
 
 
-def judge_from_env() -> Judge:
+DEFAULT_JUDGE_MODEL = "claude-opus-4-8"
+
+
+def judge_from_env(settings: Settings | None = None) -> Judge:
+    """The judge for a CLI run: the environment's model and effort when
+    set (one run's override), else the store settings' ``judge.model`` and
+    ``judge.effort`` (what the feeders run), else the library default."""
     if os.environ.get("TOPICSLEUTH_JUDGE") == "scripted":
         from topicsleuth.backends.fake import shared
         return shared("judge")
     from topicsleuth.backends.anthropic import AnthropicJudge
-    return AnthropicJudge(model=os.environ.get("TOPICSLEUTH_JUDGE_MODEL", "claude-opus-4-8"),
-                          effort=os.environ.get("TOPICSLEUTH_JUDGE_EFFORT") or None)
+    configured = settings.judge if settings is not None else None
+    model = os.environ.get("TOPICSLEUTH_JUDGE_MODEL") or (configured.model if configured else None) or DEFAULT_JUDGE_MODEL
+    effort = os.environ.get("TOPICSLEUTH_JUDGE_EFFORT") or (configured.effort if configured else None) or None
+    return AnthropicJudge(model=model, effort=effort)
 
 
 def decision_model_from_env() -> DecisionModel | None:
@@ -98,6 +106,6 @@ def backends_from_env(settings: Settings, *, need_judge: bool = True, need_embed
     return Backends(
         store=store_from_env(settings),
         embedder=embedder_from_env(settings) if need_embedder else None,  # type: ignore[arg-type]
-        judge=judge_from_env() if need_judge else None,  # type: ignore[arg-type]
+        judge=judge_from_env(settings) if need_judge else None,  # type: ignore[arg-type]
         decision_model=decision_model_from_env(),
     )
