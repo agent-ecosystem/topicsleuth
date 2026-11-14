@@ -79,7 +79,8 @@ def judge_from_env() -> Judge:
         from topicsleuth.backends.fake import shared
         return shared("judge")
     from topicsleuth.backends.anthropic import AnthropicJudge
-    return AnthropicJudge(model=os.environ.get("TOPICSLEUTH_JUDGE_MODEL", "claude-opus-4-8"))
+    return AnthropicJudge(model=os.environ.get("TOPICSLEUTH_JUDGE_MODEL", "claude-opus-4-8"),
+                          effort=os.environ.get("TOPICSLEUTH_JUDGE_EFFORT") or None)
 
 
 def decision_model_from_env() -> DecisionModel | None:

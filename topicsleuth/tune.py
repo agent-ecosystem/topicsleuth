@@ -121,6 +121,8 @@ def _summarize_diagnostics(decisions: list[dict]) -> dict[str, Any]:
         "mean_tag_only_candidates": _mean([g["tag_only_candidates"] for g in diags]),
         "mean_input_tokens": _mean([g.get("input_tokens") for g in diags]),
         "mean_output_tokens": _mean([g.get("output_tokens") for g in diags]),
+        "mean_cache_read_input_tokens": _mean([g.get("cache_read_input_tokens") for g in diags]),
+        "mean_cache_creation_input_tokens": _mean([g.get("cache_creation_input_tokens") for g in diags]),
         "mean_classified_per_call": _mean([len(g.get("classified", [])) for g in diags]),
         "chosen_channel": dict(Counter(
             g["chosen_channel"] for g in diags if g.get("chosen_channel")
@@ -252,7 +254,7 @@ def replay_synthesis(
         else:
             print(f"sample: {len(sample)} items (seed={seed}, query={sample_query})")
         print(
-            f"model={getattr(judge, 'model', '?')} "
+            f"model={getattr(judge, 'model', '?')} effort={getattr(judge, 'effort', None) or 'default'} "
             f"vector_limit={settings.candidates.vector_limit} "
             f"tag_overlap={settings.candidates.tag_overlap} "
             f"ignored_tags={settings.candidates.ignored_tags} "
@@ -321,6 +323,7 @@ def replay_synthesis(
         "config": {
             "library_version": _library_version(),
             "model": getattr(judge, "model", None),
+            "effort": getattr(judge, "effort", None),
             "embedding_model": getattr(embedder, "model", None),
             "decision_model": getattr(decision_model, "model", None) if decision_model else None,
             "domain": settings.domain,
@@ -404,7 +407,9 @@ def _print_summary(summary: dict[str, Any], output_path: Path) -> None:
         print("RETRIEVAL / PROMPT DIAGNOSTICS")
         print(f"  mean candidates per call   {diag.get('mean_total_candidates')}"
               f"  (tag-only: {diag.get('mean_tag_only_candidates')})")
-        print(f"  mean input tokens per call {diag.get('mean_input_tokens')}")
+        print(f"  mean input tokens per call {diag.get('mean_input_tokens')}"
+              f"  (cache read: {diag.get('mean_cache_read_input_tokens')}, cache write: {diag.get('mean_cache_creation_input_tokens')})")
+        print(f"  mean output tokens per call {diag.get('mean_output_tokens')}  (thinking included)")
         print(f"  mean classified per call   {diag.get('mean_classified_per_call')}")
         print(f"  linked topic channel       {diag.get('chosen_channel')}")
         print(f"  linked topic vector rank   {diag.get('chosen_vector_rank')}")

@@ -34,8 +34,8 @@ dependencies = [
 [project.optional-dependencies]
 mongo = ["pymongo>=4.6"]
 voyage = ["voyageai"]
-anthropic = ["anthropic"]
-all = ["pymongo>=4.6", "voyageai", "anthropic"]
+anthropic = ["anthropic>=0.77"]   # output_config (effort) arrived in 0.77.0
+all = ["pymongo>=4.6", "voyageai", "anthropic>=0.77"]
 test = ["pytest>=7.0"]
 
 [project.urls]

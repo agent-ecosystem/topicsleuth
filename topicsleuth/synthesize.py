@@ -1182,6 +1182,8 @@ def _build_diagnostics(
         "decision_scores": parsed.get("decision_scores"),
         "confirm_input_tokens": getattr(confirm_response, "input_tokens", None),
         "confirm_output_tokens": getattr(confirm_response, "output_tokens", None),
+        "confirm_cache_read_input_tokens": getattr(confirm_response, "cache_read_input_tokens", None),
+        "confirm_cache_creation_input_tokens": getattr(confirm_response, "cache_creation_input_tokens", None),
         "vector_candidates": len(vector_candidates),
         "tag_candidates": len(tag_candidates),
         "tag_only_candidates": len(merged_candidates) - len(vector_candidates),
@@ -1198,6 +1200,8 @@ def _build_diagnostics(
         "dropped_links": [{"topic_id": l["topic_id"], "strength": l["strength"]} for l in parsed.get("dropped_links") or []],
         "input_tokens": getattr(response, "input_tokens", None),
         "output_tokens": getattr(response, "output_tokens", None),
+        "cache_read_input_tokens": getattr(response, "cache_read_input_tokens", None),
+        "cache_creation_input_tokens": getattr(response, "cache_creation_input_tokens", None),
     }
 
 

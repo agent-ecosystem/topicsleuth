@@ -467,6 +467,8 @@ def cmd_tune(args):
         ]
     if args.model:
         b.judge.model = args.model
+    if args.effort:
+        b.judge.effort = args.effort
     sample_query = json.loads(args.sample_query) if args.sample_query else None
     if not args.replay and sample_query is None:
         raise SystemExit("tune synthesize needs --replay <report> or --sample-query '<json>'")
@@ -602,6 +604,8 @@ def main():
     tune_parser.add_argument("--output", type=str, default=None, help="Path to write JSON report (default: tuning_runs/synthesize-<ts>.json)")
     tune_parser.add_argument("--label", type=str, default=None, help="Short label used in the output filename instead of a timestamp")
     tune_parser.add_argument("--model", type=str, default=None, help="Override the judge model for this run")
+    tune_parser.add_argument("--effort", type=str, default=None, choices=["low", "medium", "high", "xhigh", "max"],
+                             help="Override the judge's reasoning effort for this run (models that think bill it as output)")
     tune_parser.add_argument("--limit", type=int, default=None, help="Override candidates.vector_limit for this run")
     tune_parser.add_argument("--no-tag-overlap", action="store_true", help="Disable the tag-overlap candidate channel (vector search only)")
     tune_parser.add_argument("--confirm-backend", choices=["judge", "decision"], default=None, help="Which reviewer checks propose_new decisions (default: settings.yaml)")

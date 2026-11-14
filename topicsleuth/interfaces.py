@@ -94,13 +94,24 @@ class Completion:
     ``refused`` is True when the provider declined to answer and ``text``
     is empty, False when it answered, None when the backend did not say.
     Each backend maps its own vocabulary for why generation stopped to
-    these bits; the core never sees a provider's string."""
+    these bits; the core never sees a provider's string.
+
+    ``input_tokens`` is what the provider billed at full price; where the
+    backend caches the system prompt, the cached part arrives separately
+    as ``cache_read_input_tokens`` (a hit, billed at a fraction) or
+    ``cache_creation_input_tokens`` (the write). A caller pricing a run
+    adds all three; a backend that does not cache leaves the two unset.
+    ``output_tokens`` includes any thinking the model did before
+    answering, which is how a model that cannot turn thinking off shows
+    up in a replay: the same prompt, more output tokens."""
 
     text: str
     input_tokens: int | None = None
     output_tokens: int | None = None
     truncated: bool | None = None
     refused: bool | None = None
+    cache_read_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
 
     def require_complete(self, what: str, setting: str = "max_tokens") -> "Completion":
         """Return self, or raise ``JudgeRefused`` if the judge declined to
